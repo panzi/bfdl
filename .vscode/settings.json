@@ -1,0 +1,8 @@
+{
+	"python.linting.pylintEnabled": true,
+
+	"[python]": {
+		"editor.tabSize": 4,
+		"editor.insertSpaces": true
+	}
+}

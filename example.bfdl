@@ -1,0 +1,210 @@
+// binary format description language
+
+// defaults for this file
+// could also be for each struct or field without the !
+// these are the defaults anyway:
+#![endian=little]
+#![alignment=4]
+#![array_element_alignment=packed] // or expanded
+#![size_type=uint32]
+#![encoding="UTF-8"]
+
+// builtin primitive types:
+//
+// int8
+// uint8
+// byte
+// int16
+// uint16
+// int32
+// uint32
+// int64
+// uint64
+// float
+// double
+// bool
+//
+// bool has a size of 1 and is 4 byte aligned by default. The numeric value 1
+// is true and 0 is false. You can adjust that using e.g.:
+//
+// #[size=4]
+// #[true_value=0xFFFFFF]
+// #[false_value=0x0]
+// bool foo;
+//
+// byte is basically like uint8, except in some language targets it's different,
+// especially as an array. E.g. byte[] will translate to bytes in Python, but
+// uint8[] will strnalate to list with int items. The size can be given by
+// referencing a preceeding field, e.g.:
+//
+// struct Example1 {
+//     uint32 array_size;
+//     uint32 something_else;
+//     uint32[array_size] data;
+// }
+//
+// even simple arithmetic expressions are supported:
+//
+// struct Example2 {
+//     uint32 width;
+//     uint32 height;
+//     byte[width * height * 4] rgba;
+// }
+//
+// builtin complex types:
+//
+// arrays, e.g. byte[], float[], uint32[5], int16[11]
+// arrays without a statically given size are like pascal strings and have the
+// size written down before the elements. Use e.g. #[size_type=uint8] to control
+// the type of the size varaible.
+//
+// strings. Pascal strings where the size is a byte count even if the encoding
+// is UTF-16 or UTF-32. Use byte[123] and decode it yourself for fixed memory
+// size strings.
+//
+// structs:
+// Are as you might expect. The tail of a struct can be optional. Meaning if the
+// file to be read is too small it can be left out and initialized with the default
+// value (which is per default something like null or None for structs, the empty
+// string, or 0 and 0.0 for numeric fields):
+//
+// struct Example3 {
+//   int32  foo;
+//   int32? tail1;
+//   int32? tail2 = 123;
+// }
+//
+// structs can have a dynamically_sized attribute. Then the first field of the
+// struct gives the size of the struct.
+//
+// When the size field includes its own size:
+// #[dynamically_sized=inclusive]
+// struct Example4 {
+//     uint32 size;
+//     ...
+// }
+//
+// When the size field doesn't include it's own size:
+// #[dynamically_sized=exclusive]
+// struct Example4 {
+//     uint32 size;
+//     ...
+// }
+//
+// TODO: enums, flags
+//
+// Maybe there should be some kind of import facility?
+//
+// import "file.bfdl";
+// import { Struct1, Struct2 as Struct3 } from "file.bfdl";
+//
+// Initial plan is to generate code for Python and C.
+
+struct GLTextureSettings {
+	int32 filter_mode;
+	int32 aniso;
+	float mip_bias;
+	int32 warp_u;
+	int32 warp_v;
+	int32 warp_w;
+}
+
+/**
+ * this is a
+ * multiline comment
+*/
+
+/**/
+/***/
+/****/
+
+struct StreamingInfo {
+	uint32 offset;
+	uint32 size;
+
+	#[size_type=uint32]
+	#[encoding="UTF-8"]
+	string path;
+}
+
+struct Texture2D {
+	string name;
+	int32  forced_feedback_format;
+	bool   downscale_fallback;
+	int32  width;
+	int32  height;
+	int32  complete_image_size;
+	int32  texture_format;
+	int32  mip_count;
+	bool   is_readable;
+	bool   streaming_mipmaps
+	int32  image_count;
+	int32  texture_dimension;
+	GLTextureSetings texture_settings;
+	int32  lightmap_format;
+	int32  color_space;
+	byte[] image_data;
+	StreamingInfo? stream_data;
+}
+
+#[dynamically_sized=inclusive]
+struct DDSPixelFormat {
+	int32   size = 32;
+	int32   flags;
+	byte[4] four_cc;
+	int32   rgb_bit_count;
+	int32   r_bit_mask;
+	int32   g_bit_mask;
+	int32   b_bit_mask;
+	int32   a_bit_mask;
+}
+
+#[dynamically_sized=inclusive]
+struct DDSHeader {
+	int32          size = 124;
+	int32          flags;
+	int32          height;
+	int32          width;
+	int32          pitch_or_linear_size;
+	int32          depth;
+	int32          mip_map_count;
+	int32[11]      reserved1;
+	DDSPixelFormat pixel_format;
+	int32          caps;
+	int32          caps2;
+	int32          caps3;
+	int32          caps4;
+	int32          reserved2;
+}
+
+struct DDSHeaderDXT10 {
+	int32  dxgi_format; // TODO: enum support
+	int32  resource_dimensions; // TODO: enum support
+	uint32 misc_flags;
+	uint32 array_size;
+	uint32 misc_flags2;
+}
+
+struct DDSFile {
+	#[fixed]
+	byte[4] magic = b"DDS ";
+
+	// maybe instead this?
+	// const byte[4] magic = b"DDS ";
+
+	DDSHeader header;
+
+	if (header.four_cc == b"DX10") {
+		DDSHeaderDXT10 header10;
+	}
+
+	byte[
+		header.width * header.height == 0 ? 0 :
+		
+		// ceiling integer division
+		header.pixel_format.four_cc == b"DXT1" ? 1 + (((header.width * header.height) - 1) / 2) :
+
+		header.pixel_format.four_cc == b"DXT5" ? header.width * header.height :
+		raise "unsupported pixle format"
+	] image_data;
+}

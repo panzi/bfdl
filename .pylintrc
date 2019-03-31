@@ -1,0 +1,19 @@
+[MASTER]
+init-hook='import sys; sys.path.append("./bfdl")'
+
+[BASIC]
+# Regular expression matching correct class attribute names
+class-attribute-rgx=([A-Za-z_][A-Za-z0-9_]{1,30}|(__.*__))$
+
+# Naming hint for class attribute names
+class-attribute-name-hint=([A-Za-z_][A-Za-z0-9_]{1,30}|(__.*__))$
+
+[FORMAT]
+max-line-length=125
+
+[MESSAGES CONTROL]
+disable=C0326,C0111,R0903
+
+# C0326: bad-whitespace
+# C0111: missing-docstring
+# R0903: too-few-public-methods
