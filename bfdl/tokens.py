@@ -14,6 +14,8 @@ class TOK(Enum):
     EQ         = '=='
     NE         = '!='
     BANG       = '!'
+    LSHIFT     = '<<'
+    RSHIFT     = '>>'
     LE         = '<='
     GE         = '>='
     LT         = '<'
@@ -40,6 +42,7 @@ class TOK(Enum):
     IMPORT     = 'import' # reserved for future use
     FROM       = 'from'   # reserved for future use
     RAISE      = 'raise'  # reserved for future use
+    TYPE       = 'type'   # reserved for future use
     DOT        = '.'
     SEMICOL    = ';'
     COMMA      = ','
