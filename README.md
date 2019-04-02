@@ -19,15 +19,21 @@ Backus-Naur Form
 
 ```BNF
 
-BDFLFile ::= FileAnnotation*
-            Struct*
+BDFLFile ::= FileAttribute*
+             Import*
+             Struct*
 
-Struct ::= Annotation*
+Import ::= "import" String ";"
+         | "import" "{" ImportRef ("," ImportRef)* [","] "}" "from" String ";"
+
+ImportRef ::= Identifier ["as" Identifier]
+
+Struct ::= Attribute*
            "struct" Identifier "{"
                ( Field | ConditionalSection ) *
            "}"
 
-Field ::= Annotation* Type Identifier [ "=" Value ] ";"
+Field ::= Attribute* Type Identifier [ "=" Value ] ";"
 
 ConditionalSection ::= "if" "(" Expression ")" "{"
                            ( Field | ConditionalSection ) *
@@ -45,11 +51,12 @@ PrimitiveType ::= "byte" | "uint8" | "int8" | "uint16" | "int16"
                 | "uint32" | "int32" | "uint64" | "int64"
                 | "float" | "double" | "bool"
 
-FileAnnotation ::= "!#" AnnotationBody
+# not sure if I want to keep the "#"
+FileAttribute ::= "!" "#" AttributeBody
 
-Annotation ::= "#" AnnotationBody
+Attribute ::= "#" AttributeBody
 
-AnnotationBody ::= "[" Identifier ["=" (Value | Identifier | Type)] "]"
+AttributeBody ::= "[" Identifier ["=" (Value | Identifier | Type)] "]"
 
 Value ::= Integer | Boolean | Float | String | Byte | ByteArray | Array
 
@@ -92,7 +99,7 @@ MulExpr ::= UnaryExpr
           | MulExpr "/" UnaryExpr
           | MulExpr "%" UnaryExpr
 
-UnaryExpr ::= PostfixExpr | UnaryOp UnaryExpr
+UnaryExpr ::= PostfixExpr | UnaryOp UnaryExpr | "raise" String
 
 PostfixExpr ::= PrimaryExpr
               | PostfixExpr "." Identifier

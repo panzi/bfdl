@@ -45,6 +45,7 @@ REG_EXPS = OrderedDict([
     (TOK.ENUM,      r'\benum\b'),
     (TOK.IMPORT,    r'\bimport\b'),
     (TOK.FROM,      r'\bfrom\b'),
+    (TOK.AS,        r'\bas\b'),
     (TOK.RAISE,     r'\braise\b'),
     (TOK.TYPE,      r'\btype\b'),
     (TOK.ID,        r'\b[_a-zA-Z][_a-zA-Z0-9]*\b'),
@@ -76,7 +77,7 @@ TOKENIZER = re.compile(
     re.M | re.U
 )
 
-def tokenize(source):
+def tokenize(source: str, fileid:int=-1):
     index  = 0
     lineno = 1
     column = 1
@@ -85,7 +86,7 @@ def tokenize(source):
         match = TOKENIZER.match(source, index)
         if not match:
             raise IllegalTokenError(Atom(
-                lineno, column, lineno, column + 1,
+                fileid, lineno, column, lineno, column + 1,
                 TOK.ILLEGAL, source[index:index + 1]))
 
         end_index = match.end()
@@ -107,7 +108,8 @@ def tokenize(source):
         end_column = column
 
         if not token in IGNORABLE:
-            yield Atom(start_lineno, start_column, end_lineno, end_column, token, value)
+            yield Atom(fileid, start_lineno, start_column,
+                       end_lineno, end_column, token, value)
 
         index = end_index
 

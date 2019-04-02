@@ -37,12 +37,13 @@ class TOK(Enum):
     FLOAT      = '0.0'
     BOOL       = 'bool'
     STRUCT     = 'struct'
-    IF         = 'if'     # reserved for future use
-    ENUM       = 'enum'   # reserved for future use
-    IMPORT     = 'import' # reserved for future use
-    FROM       = 'from'   # reserved for future use
-    RAISE      = 'raise'  # reserved for future use
-    TYPE       = 'type'   # reserved for future use
+    IF         = 'if'
+    ENUM       = 'enum' # reserved for future use
+    TYPE       = 'type' # reserved for future use
+    IMPORT     = 'import'
+    FROM       = 'from'
+    AS         = 'as'
+    RAISE      = 'raise'
     DOT        = '.'
     SEMICOL    = ';'
     COMMA      = ','
@@ -52,6 +53,15 @@ class TOK(Enum):
     BYTE       = "''"
     BYTES      = 'b""'
     SPACE      = ' '
-    ILLEGAL    = ''
+    ILLEGAL    = '<illegal>'
+    EOF        = '<eof>'
 
 IGNORABLE = (TOK.COMMENT, TOK.SPACE)
+
+OPEN_PARENS = {
+    TOK.PAR_CLOSE: TOK.PAR_OPEN,
+    TOK.BR_CLOSE:  TOK.BR_OPEN,
+    TOK.CUR_CLOSE: TOK.CUR_OPEN,
+}
+
+CLOSE_PARENS = dict((val, key) for key, val in OPEN_PARENS.items())
