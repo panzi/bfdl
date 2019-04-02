@@ -43,9 +43,9 @@ Type ::= PrimitiveType | ArrayType | TypeName
 
 TypeName ::= Identifier
 
-ArrayType ::= Type "[" "]" |
-              Type "[" Integer "]" |
-              Type "[" Expression "]"
+ArrayType ::= Type "[" "]"
+            | Type "[" Integer "]"
+            | Type "[" Expression "]"
 
 PrimitiveType ::= "byte" | "uint8" | "int8" | "uint16" | "int16"
                 | "uint32" | "int32" | "uint64" | "int64"
