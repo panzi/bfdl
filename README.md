@@ -51,16 +51,22 @@ PrimitiveType ::= "byte" | "uint8" | "int8" | "uint16" | "int16"
                 | "uint32" | "int32" | "uint64" | "int64"
                 | "float" | "double" | "bool"
 
-# not sure if I want to keep the "#"
+# Not sure if I want to keep the "#" for attributes or
+# if the brackets are enough.
 FileAttribute ::= "!" "#" AttributeBody
 
 Attribute ::= "#" AttributeBody
 
 AttributeBody ::= "[" Identifier ["=" (Value | Identifier | Type)] "]"
 
-Value ::= Integer | Boolean | Float | String | Byte | ByteArray | Array
+Value ::= Integer | Boolean | Float | String | Byte | ByteArray
+        | ArrayLiteral | StructLiteral
 
-Array ::= "{" Value ("," Value)* [","] "}"
+ArrayLiteral ::= ArrayType "{" Value ("," Value)* [","] "}"
+
+StructLiteral ::= TypeName "{" FieldAssignment ("," FieldAssignment) [","] "}"
+
+FieldAssignment ::= Identifier "=" Value
 
 Expression ::= ConditionalExpr
 
