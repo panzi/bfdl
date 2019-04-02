@@ -54,7 +54,7 @@ REG_EXPS = OrderedDict([
     (TOK.COMMA,     r','),
     (TOK.QUEST,     r'\?'),
     (TOK.COLON,     r':'),
-    (TOK.STR,       r'(?<!\b[^a-zA-Z]+)?"(?:[^"\n\\]|\\(?:x[0-9a-fA-F]{2}|["ntrvfb\\]|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{6}))*"'),
+    (TOK.STR,       r'(?:\b[^a-zA-Z]+)?"(?:[^"\n\\]|\\(?:x[0-9a-fA-F]{2}|["ntrvfb\\]|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{6}))*"'),
     (TOK.BYTE,      r"'(?:[^'\n\\]|\\(?:x[0-9a-fA-F]{2}|['ntrvfb\\]))'"),
     (TOK.SPACE,     r'[\s\n]+'),
 ])
