@@ -38,8 +38,9 @@ class TOK(Enum):
     BOOL       = 'bool'
     STRUCT     = 'struct'
     IF         = 'if'
-    ENUM       = 'enum' # reserved for future use
-    TYPE       = 'type' # reserved for future use
+    ENUM       = 'enum'  # reserved for future use
+    TYPE       = 'type'  # reserved for future use
+    UNION      = 'union' # reserved for future use
     IMPORT     = 'import'
     FROM       = 'from'
     AS         = 'as'
