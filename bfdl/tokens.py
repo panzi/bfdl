@@ -41,6 +41,7 @@ class TOK(Enum):
     ENUM       = 'enum'  # reserved for future use
     TYPE       = 'type'  # reserved for future use
     UNION      = 'union' # reserved for future use
+    NULL       = 'null'  # reserved for future use
     IMPORT     = 'import'
     FROM       = 'from'
     AS         = 'as'

@@ -49,6 +49,7 @@ REG_EXPS = OrderedDict([
     (TOK.RAISE,     r'\braise\b'),
     (TOK.TYPE,      r'\btype\b'),
     (TOK.UNION,     r'\bunion\b'),
+    (TOK.NULL,      r'\bnull\b'),
     (TOK.ID,        r'\b[_a-zA-Z][_a-zA-Z0-9]*\b'),
     (TOK.DOT,       r'\.'),
     (TOK.SEMICOL,   r';'),
