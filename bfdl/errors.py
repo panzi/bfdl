@@ -23,6 +23,24 @@ class IllegalTokenError(ParserError):
     def __init__(self, token: Atom, message:str=None):
         super().__init__(message or f"unexpected {token.token.name} token: {token.value}")
 
+class IllegalStringPrefixError(ParserError):
+    token: Atom
+
+    def __init__(self, token: Atom, message:str=None):
+        super().__init__(message or f"illegal string prefix: {token.value}")
+        self.token = token
+
+class IllegalImportError(ParserError):
+    name: str
+    module: str
+    token: Atom
+
+    def __init__(self, name: str, module: str, token: Atom, message:str=None):
+        super().__init__(message or f"type {name} was not found in module {repr(module)}")
+        self.name   = name
+        self.module = module
+        self.token  = token
+
 class NameConflictError(ParserError):
     name: str
     location1: Atom
@@ -33,10 +51,10 @@ class NameConflictError(ParserError):
         self.location1 = location1
         self.location2 = location2
 
-class TypeNameConflictError(ParserError):
+class TypeNameConflictError(NameConflictError):
     pass
 
-class AttributeRedeclaredError(ParserError):
+class AttributeRedeclaredError(NameConflictError):
     pass
 
 class UnbalancedParanthesesError(ParserError):

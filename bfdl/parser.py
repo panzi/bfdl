@@ -9,7 +9,7 @@ from .tokenizer import tokenize
 from .atom import Atom
 from .errors import (
     UnexpectedEndOfFileError, ParserError, IllegalTokenError, AttributeRedeclaredError,
-    UnbalancedParanthesesError
+    UnbalancedParanthesesError, TypeNameConflictError, IllegalImportError
 )
 
 class Primitive:
@@ -41,14 +41,21 @@ class ASTNode:
     def __init__(self, location: Atom):
         self.location = location
 
-class Type(ASTNode):
+class TypeRef(ASTNode):
     name: str
+
+class TypeDef(ASTNode):
+    name: str
+
+    def __init__(self, name: str, location: Atom):
+        super().__init__(location)
+        self.name = name
 
 class Field(ASTNode):
     name: str
     type: str
 
-class Struct(Type):
+class StructDef(TypeDef):
     fields: List[Field]
 
 class Value(ASTNode):
@@ -63,9 +70,9 @@ class Identifier(ASTNode):
 
 class Attribute(ASTNode):
     name: str
-    body: Union[Value | Type | Identifier | None]
+    body: Union[Value | TypeRef | Identifier | None]
 
-    def __init__(self, name: str, body: Union[Value | Type | Identifier | None], location: Atom):
+    def __init__(self, name: str, body: Union[Value | TypeRef | Identifier | None], location: Atom):
         super().__init__(location)
         self.name = name
         self.body = body
@@ -99,7 +106,7 @@ class Module:
     filename:   str
     source:     str
     attributes: Attributes
-    types: Dict[str, Type]
+    types: Dict[str, TypeDef]
 
     def __init__(self, fileid: int, filename: str, source: str, attributes: Optional[Attributes]=None):
         self.fileid     = fileid
@@ -263,20 +270,61 @@ class Parser:
         return close_tok
 
     def _parse_import(self):
+        state = self.stack[-1]
         self._expect(TOK.IMPORT)
         atom = self._peek_token()
 
         if atom.tok == TOK.STR:
             # import all types
-            module = self.parse_file(atom.parse_value())
-            # TODO
+            module_filename = atom.parse_value()
+            module = self.parse_file(module_filename)
+            for name, typedef in module.types:
+                if name in state.module.types:
+                    raise TypeNameConflictError(name, typedef.location, state.module.types[name].location)
+                state.module.types[name] = typedef
         else:
+            # import only explicitely listed types
+            import_map = {}
             with self._expect_paren(TOK.CUR_OPEN):
-                # TODO
-                pass
+                while not self._has_next(TOK.CUR_CLOSE):
+                    name_tok = self._expect(TOK.ID)
+
+                    if self._has_next(TOK.AS):
+                        self._next_token()
+                        mapped_name_tok = self._expect(TOK.ID)
+                        name = mapped_name_tok.value
+
+                        if name in state.module.types:
+                            raise TypeNameConflictError(name, mapped_name_tok, state.module.types[name].location)
+
+                        if name in import_map:
+                            raise TypeNameConflictError(name, mapped_name_tok, import_map[name][1])
+
+                        import_map[name] = (name_tok.value, mapped_name_tok)
+                    else:
+                        name = name_tok.value
+
+                        if name in state.module.types:
+                            raise TypeNameConflictError(name, name_tok, state.module.types[name].location)
+
+                        if name in import_map:
+                            raise TypeNameConflictError(name, name_tok, import_map[name][1])
+
+                        import_map[name_tok.value] = (name_tok.value, name_tok)
+
+                    if self._has_next(TOK.SEMICOL):
+                        self._next_token()
+                    else:
+                        break
 
             self._expect(TOK.FROM)
-            module = self.parse_file(self._expect(TOK.STR).parse_value())
+            module_filename = self._expect(TOK.STR).parse_value()
+            module = self.parse_file(module_filename)
+
+            for name, (mapped_name, token) in import_map.items():
+                if name not in module.types:
+                    raise IllegalImportError(name, module_filename, token)
+                state.module.types[mapped_name] = module.types[name]
 
         self._expect(TOK.SEMICOL)
 

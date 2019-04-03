@@ -74,7 +74,7 @@ if __name__ == '__main__':
 
 TOKENS = list(REG_EXPS.keys())
 
-TOKENIZER = re.compile(
+TOKENIZER = re.compile('^' +
     r'|'.join(r'(?P<%s>%s)' % (tok.name, regex) for tok, regex in REG_EXPS.items()),
     re.M | re.U
 )
