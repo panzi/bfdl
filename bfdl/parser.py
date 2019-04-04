@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+from collections import OrderedDict
 from contextlib import contextmanager
 from typing import List, Optional, Iterator, Dict, Union
 from os.path import abspath
@@ -9,15 +10,48 @@ from .tokenizer import tokenize
 from .atom import Atom
 from .errors import (
     UnexpectedEndOfFileError, ParserError, IllegalTokenError, AttributeRedeclaredError,
-    UnbalancedParanthesesError, TypeNameConflictError, IllegalImportError
+    UnbalancedParanthesesError, TypeNameConflictError, IllegalImportError, FieldRedeclaredError,
 )
 
-class Primitive:
+class ASTNode:
+    location: Atom
+
+    def __init__(self, location: Atom):
+        self.location = location
+
+class TypeRef(ASTNode):
+    name: str
+
+    def __init__(self, name: str, location: Atom):
+        super().__init__(location)
+        self.name = name
+
+class Expr(ASTNode):
+    pass
+
+class ArrayTypeRef(TypeRef):
+    item_ref: TypeRef
+    size:     Optional[Expr]
+
+    def __init__(self, location: Atom, item_ref: TypeRef, size: Optional[Expr]):
+        super().__init__(item_ref.name + '[]', location)
+        self.item_ref = item_ref
+        self.size     = size
+
+class TypeDef(ASTNode):
+    name: str
+
+    def __init__(self, name: str, location: Atom):
+        super().__init__(location)
+        self.name = name
+
+class Primitive(TypeDef):
     pytype: type
     size: int
     name: str
 
-    def __init__(self, pytype: type, size: int, name: str):
+    def __init__(self, pytype: type, size: int, name: str, location: Optional[Atom] = None):
+        super().__init__(name, location or Atom(0, 0, 0, 0, 0, TOK.TYPE, name))
         self.pytype = pytype
         self.size   = size
         self.name   = name
@@ -35,31 +69,66 @@ BOOL   = Primitive(bool,  1, "bool")
 FLOAT  = Primitive(float, 4, "float")
 DOUBLE = Primitive(float, 8, "double")
 
-class ASTNode:
-    location: Atom
-
-    def __init__(self, location: Atom):
-        self.location = location
-
-class TypeRef(ASTNode):
-    name: str
-
-class TypeDef(ASTNode):
-    name: str
-
-    def __init__(self, name: str, location: Atom):
-        super().__init__(location)
-        self.name = name
-
-class Field(ASTNode):
-    name: str
-    type: str
-
-class StructDef(TypeDef):
-    fields: List[Field]
+PRIMITIVES = dict((tp.name, tp) for tp in [
+    UINT8, INT8, BYTE, UINT16, INT16, UINT32, INT32,
+    UINT64, INT64, BOOL, FLOAT, DOUBLE,
+])
 
 class Value(ASTNode):
     pass
+
+class FieldDef(ASTNode):
+    name:       str
+    type_ref:   TypeRef
+    optional:   bool
+    default:    Optional[Value]
+    attributes: "Attributes"
+
+    def __init__(self, location: Atom, name: str, type_ref: TypeRef,
+                 default: Optional[Value], optional: bool, attributes: "Attributes"):
+        super().__init__(location)
+        self.name       = name
+        self.type_ref   = type_ref
+        self.optional   = optional
+        self.default    = default
+        self.attributes = attributes
+
+    @property
+    def fixed(self):
+        return self.attributes.get('fixed', False)
+
+class Section(ASTNode):
+    pass
+
+class UnconditionalSection(Section):
+    start_field_index: int
+    field_count: int
+
+    def __init__(self, location: Atom, start_field_index: int, field_count: int):
+        super().__init__(location)
+        self.start_field_index = start_field_index
+        self.field_count = field_count
+
+class ConditionalSection(Section):
+    condition: Expr
+    sections: List[Section]
+
+    def __init__(self, location: Atom, condition: Expr, sections: List[Section]):
+        super().__init__(location)
+        self.condition = condition
+        self.sections  = sections
+
+class StructDef(TypeDef):
+    fields:   List[FieldDef]
+    size:     Optional[int]
+    sections: List[Section]
+
+    def __init__(self, name: str, location: Atom, fields: List[FieldDef]=None,
+                 size: Optional[int]=None, sections: List[Section]=None):
+        super().__init__(name, location)
+        self.fields   = fields if fields is not None else []
+        self.size     = size
+        self.sections = sections if sections is not None else []
 
 class Identifier(ASTNode):
     name: str
@@ -70,12 +139,12 @@ class Identifier(ASTNode):
 
 class Attribute(ASTNode):
     name: str
-    body: Union[Value | TypeRef | Identifier | None]
+    value: Union[Value | TypeRef | Identifier | None]
 
-    def __init__(self, name: str, body: Union[Value | TypeRef | Identifier | None], location: Atom):
+    def __init__(self, name: str, value: Union[Value | TypeRef | Identifier | None], location: Atom):
         super().__init__(location)
-        self.name = name
-        self.body = body
+        self.name  = name
+        self.value = value
 
 class Attributes:
     parent: Optional["Attributes"]
@@ -87,13 +156,22 @@ class Attributes:
         self.defined_attrs = defined_attrs or {}
         self.parent = parent
 
-    def __contains__(self, name: str):
+    def __contains__(self, name: str) -> bool:
         return name in self.defined_attrs or (self.parent is not None and name in self.parent)
 
-    def __getitem__(self, name: str):
+    def __getitem__(self, name: str) -> Attribute:
         if self.parent is None or name in self.defined_attrs:
             return self.defined_attrs[name]
         return self.parent[name]
+
+    def get(self, name: str, default=None):
+        if name in self.defined_attrs:
+            return self.defined_attrs[name]
+
+        if self.parent is not None and name in self.parent:
+            return self.parent[name]
+
+        return default
 
     def declare(self, attr: Attribute):
         if attr.name in self.defined_attrs:
@@ -106,7 +184,8 @@ class Module:
     filename:   str
     source:     str
     attributes: Attributes
-    types: Dict[str, TypeDef]
+    types:          Dict[str, TypeDef] # imported and declared
+    declared_types: Dict[str, TypeDef]
 
     def __init__(self, fileid: int, filename: str, source: str, attributes: Optional[Attributes]=None):
         self.fileid     = fileid
@@ -114,6 +193,24 @@ class Module:
         self.source     = source
         self.attributes = attributes or Attributes()
         self.types      = {}
+
+    def declare(self, name: str, typedef: TypeDef):
+        if name in self.types:
+            raise TypeNameConflictError(name, typedef.location, self.types[name].location)
+        self.declared_types[name] = self.types[name] = typedef
+
+    def import_type(self, name: str, typedef: TypeDef):
+        if name in self.types:
+            raise TypeNameConflictError(name, typedef.location, self.types[name].location)
+        self.types[name] = typedef
+
+    def declare_all(self, types: Dict[str, TypeDef]):
+        for name, typedef in types.items():
+            self.declare(name, typedef)
+
+    def import_all(self, types: Dict[str, TypeDef]):
+        for name, typedef in types.items():
+            self.import_type(name, typedef)
 
 class State:
     tokens: Iterator[Atom]
@@ -125,14 +222,17 @@ class State:
         self.module = module
         self.current_token = None
 
+PRELUDE = Module(0, '<prelude>', '')
+PRELUDE.declare_all(PRIMITIVES)
+
 class Parser:
     module_map: Dict[str, int]
     modules:    List[Module]
     stack:      List[State]
 
     def __init__(self):
-        self.module_map = {}
-        self.modules    = []
+        self.module_map = {0: PRELUDE}
+        self.modules    = [PRELUDE]
         self.stack      = []
 
     def parse_file(self, filename: str) -> Module:
@@ -228,7 +328,9 @@ class Parser:
             self._parse_import()
 
         while self._has_next():
-            self._parse_struct()
+            self._parse_struct_def()
+
+        # TODO: typecheck phase and calculate struct sizes
 
     def _parse_file_attribute(self):
         self._expect(TOK.BANG)
@@ -248,7 +350,7 @@ class Parser:
                     body_tok = self._next_token()
                     value = Identifier(body_tok.value, body_tok)
                 elif self._has_next(TOK.TYPE):
-                    value = self._parse_type()
+                    value = self._parse_type_ref()
                 else:
                     value = self._parse_value()
             else:
@@ -278,10 +380,8 @@ class Parser:
             # import all types
             module_filename = atom.parse_value()
             module = self.parse_file(module_filename)
-            for name, typedef in module.types:
-                if name in state.module.types:
-                    raise TypeNameConflictError(name, typedef.location, state.module.types[name].location)
-                state.module.types[name] = typedef
+            for name, typedef in module.types.items():
+                state.module.import_type(name, typedef)
         else:
             # import only explicitely listed types
             import_map = {}
@@ -300,7 +400,7 @@ class Parser:
                         if name in import_map:
                             raise TypeNameConflictError(name, mapped_name_tok, import_map[name][1])
 
-                        import_map[name] = (name_tok.value, mapped_name_tok)
+                        import_map[name] = name_tok.value
                     else:
                         name = name_tok.value
 
@@ -310,7 +410,7 @@ class Parser:
                         if name in import_map:
                             raise TypeNameConflictError(name, name_tok, import_map[name][1])
 
-                        import_map[name_tok.value] = (name_tok.value, name_tok)
+                        import_map[name_tok.value] = name_tok.value
 
                     if self._has_next(TOK.SEMICOL):
                         self._next_token()
@@ -321,26 +421,126 @@ class Parser:
             module_filename = self._expect(TOK.STR).parse_value()
             module = self.parse_file(module_filename)
 
-            for name, (mapped_name, token) in import_map.items():
-                if name not in module.types:
-                    raise IllegalImportError(name, module_filename, token)
-                state.module.types[mapped_name] = module.types[name]
+            for name, mapped_name in import_map.items():
+                state.module.import_type(mapped_name, module.types[name])
 
         self._expect(TOK.SEMICOL)
 
-    def _parse_struct(self):
+    def _parse_struct_def(self):
+        state = self.stack[-1]
+
+        attrs = Attributes(parent=state.module.attributes)
+        while self._has_next(TOK.HASH):
+            attr = self._parse_attribute()
+            attrs.declare(attr)
+
         self._expect(TOK.STRUCT)
         name_tok = self._expect(TOK.ID)
+
+        name = name_tok.value
+        if name in state.module.types:
+            raise TypeNameConflictError(name, name_tok, state.module.types[name].location)
+
+        fields   = OrderedDict()
+        stack    = []
+        section  = None
+        sections = []
+
         with self._expect_paren(TOK.CUR_OPEN):
-            # TODO
-            pass
+            while True:
+                if self._has_next(TOK.IF):
+                    section = None
+                    sections.append(self._parse_conditional_section(fields, stack))
+                elif self._has_next(TOK.CUR_CLOSE):
+                    break
+                else:
+                    field = self._parse_field_def()
+                    if section is None:
+                        section = UnconditionalSection(field.location, len(fields), 0)
+                        sections.append(section)
 
-        raise NotImplementedError
+                    if field.name in fields:
+                        raise FieldRedeclaredError(field.name, field.location, fields[field.name].location)
 
-    def _parse_type(self):
-        raise NotImplementedError
+                    fields[field.name] = field
+                    section.field_count += 1
+
+        # TODO: resolve size after typecheck phase
+        struct_def = StructDef(name, name_tok, list(fields.values()), None, sections)
+        state.module.declare(name, struct_def)
+
+    def _parse_conditional_section(self, fields: Dict[str, FieldDef], stack: List[Expr]):
+        location = self._expect(TOK.IF)
+        sections = []
+        section  = None
+
+        with self._expect_paren(TOK.PAR_OPEN):
+            condition = self._parse_expr()
+
+        stack.append(condition)
+        with self._expect_paren(TOK.CUR_OPEN):
+            while True:
+                if self._has_next(TOK.IF):
+                    section = None
+                    sections.append(self._parse_conditional_section(fields, stack))
+                elif self._has_next(TOK.CUR_CLOSE):
+                    break
+                else:
+                    field = self._parse_field_def()
+                    if section is None:
+                        section = UnconditionalSection(field.location, len(fields), 0)
+                        sections.append(section)
+
+                    if field.name in fields:
+                        raise FieldRedeclaredError(field.name, field.location, fields[field.name].location)
+
+                    fields[field.name] = field
+                    section.field_count += 1
+        stack.pop()
+
+        return ConditionalSection(location, condition, sections)
+
+    def _parse_field_def(self):
+        attrs = Attributes()
+        while self._has_next(TOK.HASH):
+            attr = self._parse_attribute()
+            attrs.declare(attr)
+
+        type_ref = self._parse_type_ref()
+        optional = False
+        if self._has_next(TOK.QUEST):
+            self._next_token()
+            optional = True
+        name_tok = self._expect(TOK.ID)
+
+        if self._has_next(TOK.ASSIGN):
+            self._next_token()
+            value = self._parse_value()
+        else:
+            value = None
+
+        self._expect(TOK.SEMICOL)
+
+        return FieldDef(name_tok, name_tok.name, type_ref, value, optional, attrs)
+
+    def _parse_type_ref(self):
+        name_tok = self._expect(TOK.ID)
+        type_ref = TypeRef(name_tok.value, name_tok)
+
+        while self._has_next(TOK.BR_OPEN):
+            with self._expect_paren(TOK.BR_OPEN):
+                if not self._has_next(TOK.BR_CLOSE):
+                    size = self._parse_expr()
+                else:
+                    size = None
+            type_ref = ArrayTypeRef(name_tok, type_ref, size)
+
+        return type_ref
 
     def _parse_value(self):
+        raise NotImplementedError
+
+    def _parse_expr(self):
         raise NotImplementedError
 
 def parse_file(filename: str):

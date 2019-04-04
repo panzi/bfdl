@@ -5,7 +5,7 @@
 // these are the defaults anyway:
 #![endian=little]
 #![alignment=4]
-#![array_element_alignment=packed] // or expanded
+#![pack_array=true] // basically collapses alignment to size
 #![size_type=uint32]
 #![encoding="UTF-8"]
 
@@ -27,7 +27,7 @@
 // bool has a size of 1 and is 4 byte aligned by default. The numeric value 1
 // is true and 0 is false. You can adjust that using e.g.:
 //
-// #[size=4]
+// #[bool_size=4]
 // #[true_value=0xFFFFFF]
 // #[false_value=0x0]
 // bool foo;

@@ -43,18 +43,21 @@ class IllegalImportError(ParserError):
 
 class NameConflictError(ParserError):
     name: str
-    location1: Atom
-    location2: Atom
+    new_location: Atom
+    old_location: Atom
 
-    def __init__(self, name: str, location1: Atom, location2: Atom, message: Optional[str]=None):
+    def __init__(self, name: str, new_location: Atom, old_location: Atom, message: Optional[str]=None):
         super().__init__(message or f'{name} redeclared')
-        self.location1 = location1
-        self.location2 = location2
+        self.new_location = new_location
+        self.old_location = old_location
 
 class TypeNameConflictError(NameConflictError):
     pass
 
 class AttributeRedeclaredError(NameConflictError):
+    pass
+
+class FieldRedeclaredError(NameConflictError):
     pass
 
 class UnbalancedParanthesesError(ParserError):

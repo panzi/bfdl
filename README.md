@@ -133,3 +133,19 @@ Comment ::= r'//[^\n]*\n|/\*(?:[^\*]|\n|\*(?!\/))*\*/'
 
 Space ::= r'\s+'
 ```
+
+Attributes
+----------
+
+| Target              | Field Type            | Name              | Type/Values                | Default     |
+| ------------------- | --------------------- | ----------------- | -------------------------- | ----------- |
+| field, struct, file | (any)                 | endian            | `little` or `big`          | `little`    |
+| field, struct, file | (any)                 | alignment         | integer                    | `4`         |
+| field, struct, file | array                 | pack_array        | boolean                    | `true`      |
+| field, struct, file | dynamic array, string | size_type         | integer type               | `uint32`    |
+| field, struct, file | string                | encoding          | string                     | `"UTF-8"`   |
+| field, struct, file | bool                  | bool_size         | integer                    | `1`         |
+| field, struct, file | bool                  | true_value        | integer                    | `1`         |
+| field, struct, file | bool                  | false_value       | integer                    | `0`         |
+| struct, file        | N/A                   | dynamically_sized | `inclusive` or `exclusive` | `inclusive` |
+| field               | (any)                 | fixed             | N/A                        | N/A         |
