@@ -2,8 +2,9 @@
 
 from collections import OrderedDict
 from contextlib import contextmanager
-from typing import List, Optional, Iterator, Dict, Union
-from os.path import abspath
+from typing import List, Optional, Iterator, Dict, Union, Set, Tuple
+from os.path import abspath, join as join_path
+from enum import Enum
 
 from .tokens import TOK
 from .tokenizer import tokenize
@@ -179,114 +180,166 @@ class Attributes:
             raise AttributeRedeclaredError(attr.name, other.location, attr.location)
         self.defined_attrs[attr.name] = attr
 
+class Import(ASTNode):
+    fielid: int
+    import_map: Optional[Dict[str, Tuple[TOK, TOK]]]
+
+    def __init__(self, location: Atom, fileid: int, import_map: Optional[Dict[str, (str, Atom)]]=None):
+        super().__init__(location)
+        self.fielid     = fileid
+        self.import_map = import_map
+
+class ModuleState:
+    LOADING  = 0
+    LOADED   = 1
+    FINISHED = 2
+
 class Module:
     fileid:     int
     filename:   str
     source:     str
+    state:      ModuleState
     attributes: Attributes
-    types:          Dict[str, TypeDef] # imported and declared
-    declared_types: Dict[str, TypeDef]
+    imports:    List[Import]
+    unfinished_refs: Set[int] # fileids of modules that import this module
+    types:           Dict[str, TypeDef] # prelude, imported and declared
+    declared_types:  Dict[str, TypeDef]
 
     def __init__(self, fileid: int, filename: str, source: str, attributes: Optional[Attributes]=None):
-        self.fileid     = fileid
-        self.filename   = filename
-        self.source     = source
-        self.attributes = attributes or Attributes()
-        self.types      = {}
+        self.fileid          = fileid
+        self.filename        = filename
+        self.source          = source
+        self.state           = ModuleState.LOADING
+        self.attributes      = attributes or Attributes()
+        self.imports         = []
+        self.unfinished_refs = set()
+        self.types           = dict(PRIMITIVES)
 
     def declare(self, name: str, typedef: TypeDef):
         if name in self.types:
             raise TypeNameConflictError(name, typedef.location, self.types[name].location)
         self.declared_types[name] = self.types[name] = typedef
 
-    def import_type(self, name: str, typedef: TypeDef):
-        if name in self.types:
-            raise TypeNameConflictError(name, typedef.location, self.types[name].location)
-        self.types[name] = typedef
-
-    def declare_all(self, types: Dict[str, TypeDef]):
-        for name, typedef in types.items():
-            self.declare(name, typedef)
-
-    def import_all(self, types: Dict[str, TypeDef]):
-        for name, typedef in types.items():
-            self.import_type(name, typedef)
-
-class State:
-    tokens: Iterator[Atom]
-    current_token: Optional[Atom]
-    module: Module
-
-    def __init__(self, tokens: Iterator[Atom], module: Module):
-        self.tokens = tokens
-        self.module = module
-        self.current_token = None
-
 PRELUDE = Module(0, '<prelude>', '')
-PRELUDE.declare_all(PRIMITIVES)
+PRELUDE.state = ModuleState.FINISHED
 
 class Parser:
-    module_map: Dict[str, int]
-    modules:    List[Module]
-    stack:      List[State]
+    _root_path:      str
+    _module_map:     Dict[str, int]
+    _modules:        List[Module]
+    _module_queue:   List[int]
+    _tokens:         Iterator[Atom]
+    _current_token:  Optional[Atom]
+    _current_module: Module
 
-    def __init__(self):
-        self.module_map = {0: PRELUDE}
-        self.modules    = [PRELUDE]
-        self.stack      = []
+    def __init__(self, root_path='.'):
+        self._root_path      = abspath(root_path)
+        self._module_map     = {0: PRELUDE}
+        self._modules        = [PRELUDE]
+        self._module_queue   = []
+        self._tokens         = iter(())
+        self._current_token  = None
+        self._current_module = PRELUDE
 
     def parse_file(self, filename: str) -> Module:
-        filename = abspath(filename)
+        filename = join_path(self._root_path, filename)
         with open(filename, "r") as stream:
             source = stream.read()
-        return self.parse_source(source, filename)
+        return self.parse_string(source, filename)
 
-    def parse_source(self, source: str, filename: str) -> Module:
-        if filename in self.module_map:
-            module = self.modules[self.module_map[filename]]
-            if module.source != source:
-                raise ParserError("re-parsing file with different source: %s" % filename)
-            return module
+    def parse_string(self, source: str, filename: str) -> Module:
+        fileid = self._queue_module(filename, source)
+        module = self._modules[fileid]
 
-        fileid = len(self.modules)
-        tokens = tokenize(source, fileid)
-        module = Module(fileid, filename, source)
-        state  = State(tokens, module)
+        finish_queue = []
+        while self._module_queue:
+            other_fileid = self._module_queue[0]
+            del self._module_queue[0]
+            other_module = self._modules[other_fileid]
 
-        self.module_map[filename] = fileid
-        self.modules.append(module)
-        self.stack.append(state)
+            self._tokens         = tokenize(other_module.source, other_fileid)
+            self._current_token  = None
+            self._current_module = other_module
+            self._parse_module()
+            self._current_module = PRELUDE
 
-        self._parse_module()
+            other_module.state = ModuleState.LOADED
 
-        self.stack.pop()
+            finish_queue.append(other_module)
+
+        finish_queue.append(module)
+
+        index = 0
+        while index < len(finish_queue):
+            other_module = finish_queue[index]
+            self._try_finish_module(other_module)
+
+            for fileid in other_module.unfinished_refs:
+                ref_module = self._modules[fileid]
+                if ref_module.state is not ModuleState.FINISHED:
+                    finish_queue.append(ref_module)
+            index += 1
 
         return module
 
+    def _try_finish_module(self, module: Module) -> bool:
+        if module.state is ModuleState.FINISHED:
+            return True
+
+        # check if all dependencies have finished
+        for imp in module.imports:
+            imp_module = self._modules[imp.fielid]
+            if imp_module.state is ModuleState.LOADING:
+                return False
+
+        # resolve imports
+        for imp in module.imports:
+            imp_module = self._modules[imp.fielid]
+            if imp.import_map is not None:
+                for mapped_name, (name_tok, mapped_name_tok) in imp.import_map.items():
+                    if mapped_name in module.declared_types:
+                        typedef = module.declared_types[mapped_name]
+                        raise TypeNameConflictError(mapped_name, typedef.location, mapped_name_tok)
+
+                    if name_tok.value not in imp_module.declared_types:
+                        raise IllegalImportError(name_tok.value, imp.fileid, name_tok)
+
+                    module.types[mapped_name] = imp_module.declared_types[name_tok.value]
+            else:
+                for name, imp_typedef in imp_module.declared_types.items():
+                    if name in module.declared_types:
+                        this_typedef = module.declared_types[name]
+                        raise TypeNameConflictError(name, this_typedef.location, imp_typedef.location)
+
+                    module.types[name] = imp_typedef
+
+            imp_module.unfinished_refs.remove(module.fileid)
+
+        module.state = ModuleState.FINISHED
+        return True
+
     def _next_token(self) -> Atom:
-        state = self.stack[-1]
-        token = state.current_token
+        token = self._current_token
         if token is None:
             try:
-                token = next(state.tokens)
+                token = next(self._tokens)
             except StopIteration:
                 raise UnexpectedEndOfFileError(self._make_eof_token())
             else:
                 return token
 
-        state.token = None
+        self._current_token = None
         return token
 
     def _peek_token(self) -> Optional[Atom]:
-        state = self.stack[-1]
-        token = state.current_token
+        token = self._current_token
         if token is None:
             try:
-                token = next(state.tokens)
+                token = next(self._tokens)
             except StopIteration:
                 return None
             else:
-                state.token = token
+                self._current_token = token
                 return token
 
         return token
@@ -303,11 +356,11 @@ class Parser:
         return True
 
     def _make_eof_token(self) -> Atom:
-        state = self.stack[-1]
-        source = state.source
+        module = self._current_module
+        source = module.source
         lineno = source.count("\n") + 1
         column = len(source) - source.rindex("\n")
-        return Atom(state.module.fileid, lineno, column, lineno, column, TOK.EOF, '')
+        return Atom(module.fileid, lineno, column, lineno, column, TOK.EOF, '')
 
     def _expect(self, tok: Optional[Atom]=None, val: Optional[str]=None) -> Atom:
         token = self._next_token()
@@ -335,8 +388,7 @@ class Parser:
     def _parse_file_attribute(self):
         self._expect(TOK.BANG)
         attr = self._parse_attribute()
-        state = self.stack[-1]
-        state.module.attributes.declare(attr)
+        self._current_module.attributes.declare(attr)
 
     def _parse_attribute(self):
         self._expect(TOK.HASH)
@@ -365,26 +417,51 @@ class Parser:
         yield open_tok
         self._expect_close(open_tok)
 
-    def _expect_close(self, open_tok: Atom):
+    def _expect_close(self, open_tok: Atom) -> Atom:
         close_tok = self._next_token()
         if close_tok.tok != open_tok.token:
             raise UnbalancedParanthesesError(open_tok, close_tok)
         return close_tok
 
+    def _queue_module(self, filename: str, source: Optional[str]=None) -> int:
+        if self._current_module is not PRELUDE and (filename.startswith('./') or filename.startswith('../')):
+            filename = join_path(self._current_module.filename, filename)
+        else:
+            filename = join_path(self._root_path, filename)
+
+        if filename in self._module_map:
+            fileid = self._module_map[filename]
+            module = self._modules[fileid]
+            if source is not None:
+                if module.source != source:
+                    raise ParserError("re-parsing file with different source: %s" % filename)
+        else:
+            if source is None:
+                with open(filename, "r") as stream:
+                    source = stream.read()
+            fileid = len(self._modules)
+            module = Module(fileid, filename, source)
+            self._module_map[filename] = fileid
+            self._modules.append(module)
+            self._module_queue.append(fileid)
+
+        if self._current_module is not PRELUDE:
+            module.unfinished_refs.add(self._current_module.fileid)
+
+        return fileid
+
     def _parse_import(self):
-        state = self.stack[-1]
         self._expect(TOK.IMPORT)
         atom = self._peek_token()
 
         if atom.tok == TOK.STR:
             # import all types
             module_filename = atom.parse_value()
-            module = self.parse_file(module_filename)
-            for name, typedef in module.types.items():
-                state.module.import_type(name, typedef)
+            fileid = self._queue_module(module_filename)
+            self._current_module.imports.append(Import(atom, fileid))
         else:
             # import only explicitely listed types
-            import_map = {}
+            import_map:Dict[str, Tuple[TOK, TOK]] = OrderedDict()
             with self._expect_paren(TOK.CUR_OPEN):
                 while not self._has_next(TOK.CUR_CLOSE):
                     name_tok = self._expect(TOK.ID)
@@ -394,23 +471,17 @@ class Parser:
                         mapped_name_tok = self._expect(TOK.ID)
                         name = mapped_name_tok.value
 
-                        if name in state.module.types:
-                            raise TypeNameConflictError(name, mapped_name_tok, state.module.types[name].location)
-
                         if name in import_map:
-                            raise TypeNameConflictError(name, mapped_name_tok, import_map[name][1])
+                            raise TypeNameConflictError(name, mapped_name_tok, import_map[name].location)
 
-                        import_map[name] = name_tok.value
+                        import_map[name] = (name_tok, mapped_name_tok)
                     else:
                         name = name_tok.value
 
-                        if name in state.module.types:
-                            raise TypeNameConflictError(name, name_tok, state.module.types[name].location)
-
                         if name in import_map:
-                            raise TypeNameConflictError(name, name_tok, import_map[name][1])
+                            raise TypeNameConflictError(name, name_tok, import_map[name].location)
 
-                        import_map[name_tok.value] = name_tok.value
+                        import_map[name_tok.value] = (name_tok, name_tok)
 
                     if self._has_next(TOK.SEMICOL):
                         self._next_token()
@@ -418,18 +489,16 @@ class Parser:
                         break
 
             self._expect(TOK.FROM)
-            module_filename = self._expect(TOK.STR).parse_value()
-            module = self.parse_file(module_filename)
 
-            for name, mapped_name in import_map.items():
-                state.module.import_type(mapped_name, module.types[name])
+            atom = self._expect(TOK.STR)
+            module_filename = atom.parse_value()
+            fileid = self._queue_module(module_filename)
+            self._current_module.imports.append(Import(atom, fileid, import_map))
 
         self._expect(TOK.SEMICOL)
 
     def _parse_struct_def(self):
-        state = self.stack[-1]
-
-        attrs = Attributes(parent=state.module.attributes)
+        attrs = Attributes(parent=self._current_module.attributes)
         while self._has_next(TOK.HASH):
             attr = self._parse_attribute()
             attrs.declare(attr)
@@ -438,8 +507,8 @@ class Parser:
         name_tok = self._expect(TOK.ID)
 
         name = name_tok.value
-        if name in state.module.types:
-            raise TypeNameConflictError(name, name_tok, state.module.types[name].location)
+        if name in self._current_module.declared_types:
+            raise TypeNameConflictError(name, name_tok, self._current_module.types[name].location)
 
         fields   = OrderedDict()
         stack    = []
@@ -467,7 +536,7 @@ class Parser:
 
         # TODO: resolve size after typecheck phase
         struct_def = StructDef(name, name_tok, list(fields.values()), None, sections)
-        state.module.declare(name, struct_def)
+        self._current_module.declare(name, struct_def)
 
     def _parse_conditional_section(self, fields: Dict[str, FieldDef], stack: List[Expr]):
         location = self._expect(TOK.IF)
@@ -543,8 +612,8 @@ class Parser:
     def _parse_expr(self):
         raise NotImplementedError
 
-def parse_file(filename: str):
-    return Parser().parse_file(filename)
+def parse_file(filename: str, root_path:str='.'):
+    return Parser(root_path).parse_file(abspath(filename))
 
-def parse_string(source: str, filename: str):
-    return Parser().parse_source(source, filename)
+def parse_string(source: str, filename: str, root_path:str='.'):
+    return Parser(root_path).parse_string(source, filename)

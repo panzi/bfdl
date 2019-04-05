@@ -32,14 +32,14 @@ class IllegalStringPrefixError(ParserError):
 
 class IllegalImportError(ParserError):
     name: str
-    module: str
-    token: Atom
+    fileid: int
+    location: Atom
 
-    def __init__(self, name: str, module: str, token: Atom, message:str=None):
-        super().__init__(message or f"type {name} was not found in module {repr(module)}")
-        self.name   = name
-        self.module = module
-        self.token  = token
+    def __init__(self, name: str, fileid: int, location: Atom, message:str=None):
+        super().__init__(message or f"type {name} was not found in imported module")
+        self.name     = name
+        self.fileid   = fileid
+        self.location = location
 
 class NameConflictError(ParserError):
     name: str
