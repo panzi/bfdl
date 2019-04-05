@@ -3,7 +3,7 @@
 from collections import OrderedDict
 from contextlib import contextmanager
 from typing import List, Optional, Iterator, Dict, Union, Set, Tuple
-from os.path import abspath, join as join_path
+from os.path import abspath, join as join_path, dirname
 from enum import Enum
 
 from .tokens import TOK
@@ -189,7 +189,7 @@ class Import(ASTNode):
         self.fielid     = fileid
         self.import_map = import_map
 
-class ModuleState:
+class ModuleState(Enum):
     LOADING  = 0
     LOADED   = 1
     FINISHED = 2
@@ -425,7 +425,7 @@ class Parser:
 
     def _queue_module(self, filename: str, source: Optional[str]=None) -> int:
         if self._current_module is not PRELUDE and (filename.startswith('./') or filename.startswith('../')):
-            filename = join_path(self._current_module.filename, filename)
+            filename = join_path(dirname(self._current_module.filename), filename)
         else:
             filename = join_path(self._root_path, filename)
 
@@ -615,5 +615,5 @@ class Parser:
 def parse_file(filename: str, root_path:str='.'):
     return Parser(root_path).parse_file(abspath(filename))
 
-def parse_string(source: str, filename: str, root_path:str='.'):
+def parse_string(source: str, filename: str='-', root_path:str='.'):
     return Parser(root_path).parse_string(source, filename)
