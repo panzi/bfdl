@@ -21,14 +21,14 @@ Backus-Naur Form
 
 BDFLFile ::= FileAttribute*
              Import*
-             Struct*
+             StructDef*
 
 Import ::= "import" String ";"
          | "import" "{" ImportRef ("," ImportRef)* [","] "}" "from" String ";"
 
 ImportRef ::= Identifier ["as" Identifier]
 
-Struct ::= Attribute*
+StructDef ::= Attribute*
            "struct" Identifier "{"
                ( Field | ConditionalSection ) *
            "}"
@@ -59,8 +59,11 @@ Attribute ::= "#" AttributeBody
 
 AttributeBody ::= "[" Identifier ["=" (Value | Identifier | Type)] "]"
 
-Value ::= Integer | Boolean | Float | String | Byte | ByteArray
-        | ArrayLiteral | StructLiteral
+Value ::= AtomicValue | ArrayLiteral | StructLiteral
+
+AtomicValue ::= PrimitiveValue | String | ByteArray | Null
+
+PrimitiveValue ::= Integer | Boolean | Float | Byte
 
 ArrayLiteral ::= ArrayType "{" Value ("," Value)* [","] "}"
 
@@ -70,7 +73,7 @@ FieldAssignment ::= Identifier "=" Value
 
 Expression ::= ConditionalExpr
 
-ConditionalExpr ::= OrExpr | OrExpr "?" Expression ":" ConditionalExpr
+ConditionalExpr ::= OrExpr | OrExpr "?" ConditionalExpr ":" ConditionalExpr
 
 OrExpr ::= AndExpr | OrExpr "||" AndExpr
 
@@ -126,6 +129,8 @@ String ::= r'"(?:[^"\n\\]|\\(?:x[0-9a-fA-F]{2}|["ntrvfb\\]|u[0-9a-fA-F]{4}|U[0-9
 Byte ::= r"'(?:[^'\n\\]|\\(?:x[0-9a-fA-F]{2}|['ntrvfb\\]))'"
 
 ByteArray ::= r'\bb"(?:[^"\n\\]|\\(?:x[0-9a-fA-F]{2}|["ntrvfb\\]))*"'
+
+Null ::= "null"
 
 Ignorable ::= Comment | Space
 

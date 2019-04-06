@@ -10,6 +10,19 @@ class BFDLError(Exception):
 class ParserError(BFDLError):
     pass
 
+class TypeUnificationError(BFDLError):
+    location1: Atom
+    location2: Atom
+    type1: str
+    type2: str
+
+    def __init__(self, location1: Atom, location2: Atom, type1: str, type2: str, message:str=None):
+        super().__init__(message or f"cannot unify types {type1} and {type2}")
+        self.location1 = location1
+        self.location2 = location2
+        self.type1 = type1
+        self.type2 = type2
+
 class UnexpectedEndOfFileError(ParserError):
     token: Atom
 
@@ -59,6 +72,10 @@ class AttributeRedeclaredError(NameConflictError):
 
 class FieldRedeclaredError(NameConflictError):
     pass
+
+class FieldRedefinedError(NameConflictError):
+    def __init__(self, name: str, new_location: Atom, old_location: Atom, message: Optional[str]=None):
+        super().__init__(name, new_location, old_location, message or f'{name} redefined')
 
 class UnbalancedParanthesesError(ParserError):
     open_token:  Atom

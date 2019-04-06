@@ -17,6 +17,14 @@ R_BYTES = re.compile(rf'\bb"((?:[^"\n\\]|{HEX}|{ESC})*)"', re.M | re.U)
 
 R_BYTES_ELEM = re.compile(rf'({HEX})|({ESC})|(.)', re.M | re.U)
 
+R_INT = re.compile(
+    r'^(?:([-+]?[0-9]+)|([-+]?0x[0-9a-fA-F]+)|([-+]?0o[0-7]+)|([-+]?0b[0-1]+))(?:([ui])(8|16|32|64)\b)?$',
+    re.M | re.U)
+
+R_FLOAT = re.compile(
+    r'([-+]?[0-9]+(?:\.[0-9]+|[eE][-+]?[0-9]+))(?:f(32|64)\b)?',
+    re.M | re.U)
+
 ESC_CHAR_MAP = {
     '\\n': '\n',
     '\\t': '\t',
@@ -69,21 +77,41 @@ class Atom:
             return R_STR_ELEM.sub(_replace_str_elem, match.group(2))
 
         elif self.token == TOK.INT:
-            val = self.value.lower()
+            match = R_INT.match(self.value)
+            signed_char = match.group(5)
+            str_bits    = match.group(6)
+            signed      = signed_char == 'i'
+            bits        = int(str_bits) if str_bits is not None else None
 
-            if val.startswith("0x"):
-                return int(self.value, 16)
+            str_val = match.group(0)
+            if str_val is not None:
+                value = int(str_val, 10)
 
-            if val.startswith("0o"):
-                return int(self.value, 8)
+            else:
+                str_val = match.group(1)
+                if str_val is not None:
+                    value = int(str_val, 16)
+                else:
+                    str_val = match.group(2)
+                    if str_val is not None:
+                        value = int(str_val, 8)
+                    else:
+                        value = int(str_val, 2)
 
-            if val.startswith("0b"):
-                return int(self.value, 2)
+            if value < 0 and not signed:
+                # circular import workaround
+                from .errors import IllegalTokenError
+                raise IllegalTokenError(self, "unsigned integer cannot be negative")
 
-            return int(self.value, 10)
+            return value, signed, bits
 
         elif self.token == TOK.FLOAT:
-            return float(self.value)
+            match    = R_FLOAT.match(self.value)
+            val      = match.group(1)
+            str_bits = match.group(2)
+            bits     = int(str_bits) if str_bits is not None else None
+
+            return float(val), bits
 
         elif self.token == TOK.BYTES:
             match = R_BYTES.match(self.value)
@@ -116,5 +144,9 @@ class Atom:
                 return ESC_BYTE_MAP[val]
 
             return ord(val)
+
+        elif self.token == TOK.NULL:
+            return None
+
         else:
             raise TypeError(f"cannot parse value of {self.token.name} token")

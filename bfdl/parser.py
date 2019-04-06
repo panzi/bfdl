@@ -2,7 +2,7 @@
 
 from collections import OrderedDict
 from contextlib import contextmanager
-from typing import List, Optional, Iterator, Dict, Union, Set, Tuple
+from typing import List, Optional, Iterator, Dict, Union, Set, Tuple, Any
 from os.path import abspath, join as join_path, dirname
 from enum import Enum
 
@@ -12,6 +12,7 @@ from .atom import Atom
 from .errors import (
     UnexpectedEndOfFileError, ParserError, IllegalTokenError, AttributeRedeclaredError,
     UnbalancedParanthesesError, TypeNameConflictError, IllegalImportError, FieldRedeclaredError,
+    FieldRedefinedError, TypeUnificationError,
 )
 
 class ASTNode:
@@ -27,18 +28,6 @@ class TypeRef(ASTNode):
         super().__init__(location)
         self.name = name
 
-class Expr(ASTNode):
-    pass
-
-class ArrayTypeRef(TypeRef):
-    item_ref: TypeRef
-    size:     Optional[Expr]
-
-    def __init__(self, location: Atom, item_ref: TypeRef, size: Optional[Expr]):
-        super().__init__(item_ref.name + '[]', location)
-        self.item_ref = item_ref
-        self.size     = size
-
 class TypeDef(ASTNode):
     name: str
 
@@ -46,7 +35,115 @@ class TypeDef(ASTNode):
         super().__init__(location)
         self.name = name
 
-class Primitive(TypeDef):
+def unify_types(lhs: TypeDef, rhs: TypeDef) -> Optional[TypeDef]:
+    if lhs is rhs:
+        return lhs
+
+    if not isinstance(lhs, PrimitiveType) or not isinstance(rhs, PrimitiveType):
+        return None
+
+    if lhs.pytype is int and rhs.pytype is int:
+        if lhs.size > rhs.size:
+            return lhs
+        elif rhs.size > lhs.size:
+            return rhs
+        elif rhs is BYTE:
+            return rhs
+        else:
+            return lhs
+
+    if lhs.pytype is float and rhs.pytype is float:
+        return rhs if rhs.size > lhs.size else lhs
+
+    if lhs.pytype is float and rhs.pytype is int:
+        return lhs
+
+    if lhs.pytype is int and rhs.pytype is float:
+        return rhs
+
+    return None
+
+class Expr(ASTNode):
+    def get_type_def(self, parser: "Parser", module: "Module") -> TypeDef:
+        raise NotImplementedError
+
+class ConditionalExpr(Expr):
+    condition:  Expr
+    true_expr:  Expr
+    false_expr: Expr
+
+    def __init__(self, condition: Expr, true_expr: Expr, false_expr: Expr, location: Atom):
+        super().__init__(location)
+        self.condition  = condition
+        self.true_expr  = true_expr
+        self.false_expr = false_expr
+
+    def get_type_def(self, parser: "Parser", module: "Module") -> TypeDef:
+        true_type  = self.true_expr.get_type_def(parser, module)
+        false_type = self.false_expr.get_type_def(parser, module)
+        typedef = unify_types(true_type, false_type)
+        if typedef is None:
+            raise TypeUnificationError(self.true_expr.location, self.false_expr.location, true_type, false_type)
+        return typedef
+
+class BinaryExpr(Expr):
+    lhs: Expr
+    rhs: Expr
+    op:  TOK
+
+    def __init__(self, lhs: Expr, rhs: Expr, op: TOK, location: Atom):
+        super().__init__(location)
+        self.lhs = lhs
+        self.rhs = rhs
+        self.op  = op
+
+class UnaryExpr(Expr):
+    op:   TOK
+    expr: Expr
+
+    def __init__(self, op: TOK, expr: Expr, location: Atom):
+        super().__init__(location)
+        self.op   = op
+        self.expr = expr
+
+class PostfixExpr(Expr):
+    pass
+
+class Identifier(ASTNode):
+    name: str
+
+    def __init__(self, name: str, location: Atom):
+        super().__init__(location)
+        self.name = name
+
+class FieldAccessExpr(PostfixExpr):
+    expr:  Expr
+    field: Identifier
+
+    def __init__(self, expr: Expr, field: Identifier, location: Atom):
+        super().__init__(location)
+        self.expr  = expr
+        self.field = field
+
+class ArrayItemAccessExpr(PostfixExpr):
+    array: Expr
+    item:  Expr
+
+    def __init__(self, array: Expr, item: Expr, location: Atom):
+        super().__init__(location)
+        self.array = array
+        self.item  = item
+
+class ArrayTypeRef(TypeRef):
+    item_ref: TypeRef
+    size:     Optional[Expr]
+
+    def __init__(self, item_ref: TypeRef, size: Optional[Expr], location: Atom):
+        super().__init__(item_ref.name + '[]', location)
+        self.item_ref = item_ref
+        self.size     = size
+
+class PrimitiveType(TypeDef):
     pytype: type
     size: int
     name: str
@@ -57,26 +154,95 @@ class Primitive(TypeDef):
         self.size   = size
         self.name   = name
 
-UINT8  = Primitive(int,   1, "uint8")
-INT8   = Primitive(int,   1, "int8")
-BYTE   = Primitive(int,   1, "byte")
-UINT16 = Primitive(int,   2, "uint16")
-INT16  = Primitive(int,   2, "int16")
-UINT32 = Primitive(int,   4, "uint32")
-INT32  = Primitive(int,   4, "int32")
-UINT64 = Primitive(int,   8, "uint64")
-INT64  = Primitive(int,   8, "int64")
-BOOL   = Primitive(bool,  1, "bool")
-FLOAT  = Primitive(float, 4, "float")
-DOUBLE = Primitive(float, 8, "double")
+UINT8  = PrimitiveType(int,   1, "uint8")
+INT8   = PrimitiveType(int,   1, "int8")
+BYTE   = PrimitiveType(int,   1, "byte")
+UINT16 = PrimitiveType(int,   2, "uint16")
+INT16  = PrimitiveType(int,   2, "int16")
+UINT32 = PrimitiveType(int,   4, "uint32")
+INT32  = PrimitiveType(int,   4, "int32")
+UINT64 = PrimitiveType(int,   8, "uint64")
+INT64  = PrimitiveType(int,   8, "int64")
+BOOL   = PrimitiveType(bool,  1, "bool")
+FLOAT  = PrimitiveType(float, 4, "float")
+DOUBLE = PrimitiveType(float, 8, "double")
 
 PRIMITIVES = dict((tp.name, tp) for tp in [
     UINT8, INT8, BYTE, UINT16, INT16, UINT32, INT32,
     UINT64, INT64, BOOL, FLOAT, DOUBLE,
 ])
 
-class Value(ASTNode):
+SIGNED_INTS   = {8: INT8,  16: INT16,  32: INT32,  64: INT64}
+UNSIGNED_INTS = {8: UINT8, 16: UINT16, 32: UINT32, 64: UINT64}
+
+FLOATS = {32: FLOAT, 64: DOUBLE}
+
+class Value(Expr):
+    value: Any
+
+class AtomicValue(Value):
     pass
+
+class PrimitiveValue(AtomicValue):
+    value: Union[int, float, bool]
+    typedef: Optional[TypeDef]
+
+    def __init__(self, typedef: Optional[TypeDef], location: Atom):
+        super().__init__(location)
+        self.typedef = typedef
+
+class Integer(PrimitiveValue):
+    value: int
+
+    def __init__(self, value: int, typedef: Optional[TypeDef], location: Atom):
+        super().__init__(typedef, location)
+        self.value = value
+
+class Float(PrimitiveValue):
+    value: float
+
+    def __init__(self, value: float, typedef: Optional[TypeDef], location: Atom):
+        super().__init__(typedef, location)
+        self.value = value
+
+class Bool(PrimitiveValue):
+    value: bool
+
+    def __init__(self, value: bool, location: Atom):
+        super().__init__(BOOL, location)
+        self.value = value
+
+class String(AtomicValue):
+    value: str
+
+    def __init__(self, value: str, location: Atom):
+        super().__init__(location)
+        self.value = value
+
+class Null(AtomicValue):
+    value: None
+
+    def __init__(self, location: Atom):
+        super().__init__(location)
+        self.value = None
+
+class ArrayLiteral(Value):
+    value:    Union[List[Any], bytes]
+    type_ref: ArrayTypeRef
+
+    def __init__(self, value: Union[List[Any], bytes], type_ref: ArrayTypeRef, location: Atom):
+        super().__init__(location)
+        self.value    = value
+        self.type_ref = type_ref
+
+class StructLiteral(Value):
+    value: Dict[str, Tuple[Identifier, Value]]
+    type_ref: TypeRef
+
+    def __init__(self, value: Dict[str, Tuple[Identifier, Value]], type_ref: TypeRef, location: Atom):
+        super().__init__(location)
+        self.value    = value
+        self.type_ref = type_ref
 
 class FieldDef(ASTNode):
     name:       str
@@ -130,13 +296,6 @@ class StructDef(TypeDef):
         self.fields   = fields if fields is not None else []
         self.size     = size
         self.sections = sections if sections is not None else []
-
-class Identifier(ASTNode):
-    name: str
-
-    def __init__(self, name: str, location: Atom):
-        super().__init__(location)
-        self.name = name
 
 class Attribute(ASTNode):
     name: str
@@ -602,14 +761,194 @@ class Parser:
                     size = self._parse_expr()
                 else:
                     size = None
-            type_ref = ArrayTypeRef(name_tok, type_ref, size)
+            type_ref = ArrayTypeRef(type_ref, size, name_tok)
 
         return type_ref
 
     def _parse_value(self):
-        raise NotImplementedError
+        if self._has_next(TOK.INT):
+            token = self._next_token()
+            value, signed, bits = token.parse_value()
+            if bits is None:
+                typedef = None
+            elif signed:
+                typedef = SIGNED_INTS[bits]
+            else:
+                typedef = UNSIGNED_INTS[bits]
+
+            return Integer(value, typedef, token)
+
+        elif self._has_next(TOK.BYTE):
+            token = self._next_token()
+            return Integer(token.parse_value(), BYTE, token)
+
+        elif self._has_next(TOK.FLOAT):
+            token = self._next_token()
+            value, bits = token.parse_value()
+            if bits is None:
+                typedef = None
+            else:
+                typedef = FLOATS[bits]
+
+            return Float(value, typedef, token)
+
+        elif self._has_next(TOK.BOOL):
+            token = self._next_token()
+            return Bool(token.parse_value(), token)
+
+        elif self._has_next(TOK.STR):
+            token = self._next_token()
+            return String(token.parse_value(), token)
+
+        elif self._has_next(TOK.BYTES):
+            token = self._next_token()
+            value = token.parse_value()
+            return ArrayLiteral(value, ArrayTypeRef(TypeRef(BYTE.name, token), len(value), token), token)
+
+        elif self._has_next(TOK.NULL):
+            token = self._next_token()
+            return Null(token)
+
+        type_ref = self._parse_type_ref()
+
+        with self._expect_paren(TOK.BR_OPEN):
+            if isinstance(type_ref, ArrayTypeRef):
+                items = []
+                # parse array literal
+                while not self._has_next(TOK.CUR_CLOSE):
+                    value = self._parse_value()
+                    items.append(value)
+
+                    if self._has_next(TOK.SEMICOL):
+                        self._next_token()
+                    else:
+                        break
+
+                value = ArrayLiteral(items, type_ref, type_ref.location)
+            else:
+                items: Dict[str, Tuple[Identifier, Value]] = OrderedDict()
+                # parse struct literal
+                while not self._has_next(TOK.CUR_CLOSE):
+                    ident_tok = self._expect(TOK.ID)
+                    key = Identifier(ident_tok.value, ident_tok)
+                    if key.name in items:
+                        raise FieldRedefinedError(key, ident_tok, items[key][0])
+
+                    self._expect(TOK.COLON)
+                    value = self._parse_value()
+                    items[key.name] = (key, value)
+
+                    if self._has_next(TOK.SEMICOL):
+                        self._next_token()
+                    else:
+                        break
+
+                value = StructLiteral(items, type_ref, type_ref.location)
+
+        return value
 
     def _parse_expr(self):
+        return self._parse_cond_expr()
+
+    def _parse_cond_expr(self):
+        expr = self._parse_or_expr()
+
+        while self._has_next(TOK.QUEST):
+            self._next_token()
+            true_expr = self._parse_cond_expr()
+            self._expect(TOK.COLON)
+            false_expr = self._parse_cond_expr()
+            expr = ConditionalExpr(expr, true_expr, false_expr, expr.location)
+
+        return expr
+
+    def _parse_or_expr(self):
+        expr = self._parse_and_expr()
+        while self._has_next(TOK.OR):
+            self._next_token()
+            rhs = self._parse_and_expr()
+            expr = BinaryExpr(expr, rhs, TOK.OR, expr.location)
+        return expr
+
+    def _parse_and_expr(self):
+        expr = self._parse_bit_or_expr()
+        while self._has_next(TOK.AND):
+            self._next_token()
+            rhs = self._parse_bit_or_expr()
+            expr = BinaryExpr(expr, rhs, TOK.AND, expr.location)
+        return expr
+
+    def _parse_bit_or_expr(self):
+        expr = self._parse_xor_expr()
+        while self._has_next(TOK.BOR):
+            self._next_token()
+            rhs = self._parse_xor_expr()
+            expr = BinaryExpr(expr, rhs, TOK.BOR, expr.location)
+        return expr
+
+    def _parse_xor_expr(self):
+        expr = self._parse_bit_and_expr()
+        while self._has_next(TOK.XOR):
+            self._next_token()
+            rhs = self._parse_bit_and_expr()
+            expr = BinaryExpr(expr, rhs, TOK.XOR, expr.location)
+        return expr
+
+    def _parse_bit_and_expr(self):
+        expr = self._parse_eq_expr()
+        while self._has_next(TOK.BAND):
+            self._next_token()
+            rhs = self._parse_eq_expr()
+            expr = BinaryExpr(expr, rhs, TOK.BAND, expr.location)
+        return expr
+
+    def _parse_eq_expr(self):
+        expr = self._parse_rel_expr()
+        while self._has_next(TOK.EQ) or self._has_next(TOK.NE):
+            operator = self._next_token()
+            rhs = self._parse_rel_expr()
+            expr = BinaryExpr(expr, rhs, operator.token, expr.location)
+        return expr
+
+    def _parse_rel_expr(self):
+        expr = self._parse_shift_expr()
+        while self._has_next(TOK.LT) or self._has_next(TOK.GT) or self._has_next(TOK.LE) or self._has_next(TOK.GE):
+            operator = self._next_token()
+            rhs = self._parse_shift_expr()
+            expr = BinaryExpr(expr, rhs, operator.token, expr.location)
+        return expr
+
+    def _parse_shift_expr(self):
+        expr = self._parse_add_expr()
+        while self._has_next(TOK.LSHIFT) or self._has_next(TOK.RSHIFT):
+            operator = self._next_token()
+            rhs = self._parse_add_expr()
+            expr = BinaryExpr(expr, rhs, operator.token, expr.location)
+        return expr
+
+    def _parse_add_expr(self):
+        expr = self._parse_mul_expr()
+        while self._has_next(TOK.ADD) or self._has_next(TOK.SUB):
+            operator = self._next_token()
+            rhs = self._parse_mul_expr()
+            expr = BinaryExpr(expr, rhs, operator.token, expr.location)
+        return expr
+
+    def _parse_mul_expr(self):
+        expr = self._parse_unary_expr()
+        while self._has_next(TOK.MUL) or self._has_next(TOK.DIV) or self._has_next(TOK.MOD):
+            operator = self._next_token()
+            rhs = self._parse_unary_expr()
+            expr = BinaryExpr(expr, rhs, operator.token, expr.location)
+        return expr
+
+    def _parse_unary_expr(self):
+        raise NotImplementedError
+
+    def _parse_postfix_expr(self):
+        raise NotImplementedError
+
+    def _parse_primary_expr(self):
         raise NotImplementedError
 
 def parse_file(filename: str, root_path:str='.'):
