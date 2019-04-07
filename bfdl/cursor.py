@@ -1,19 +1,5 @@
 #!/usr/bin/env python3
 
-class Cursor:
-    fileid: int
-    index:  int
-
-    def __init__(self, fileid: int, index: int):
-        self.fileid = fileid
-        self.index  = index
-
-    def clone(self) -> "Cursor":
-        return Cursor(self.fileid, self.index)
-
-    def to_span(self):
-        return Span(self.fileid, self.index, self.index + 1)
-
 class Span:
     fielid:      int
     start_index: int
@@ -26,6 +12,20 @@ class Span:
 
     def clone(self) -> "Span":
         return Span(self.fileid, self.start_index, self.end_index)
+
+class Cursor:
+    fileid: int
+    index:  int
+
+    def __init__(self, fileid: int, index: int):
+        self.fileid = fileid
+        self.index  = index
+
+    def clone(self) -> "Cursor":
+        return Cursor(self.fileid, self.index)
+
+    def to_span(self) -> Span:
+        return Span(self.fileid, self.index, self.index + 1)
 
 def make_span(cursor1: Cursor, cursor2: Cursor) -> Span:
     if cursor1.fileid != cursor2.fileid:

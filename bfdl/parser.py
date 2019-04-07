@@ -3,7 +3,7 @@
 import re
 from collections import OrderedDict
 from contextlib import contextmanager
-from typing import List, Optional, Iterator, Dict, Union, Set, Tuple, Any
+from typing import List, Optional, Iterator, Dict, Union, Set, Tuple, Any, Generator, Match
 from os.path import abspath, join as join_path, dirname
 from enum import Enum
 
@@ -54,7 +54,7 @@ ESC_CHAR_MAP = {
 
 ESC_BYTE_MAP = dict((esc, ord(char)) for esc, char in ESC_CHAR_MAP.items())
 
-def _replace_str_elem(match):
+def _replace_str_elem(match: Match[str]) -> str:
     val = match.group(1)
     if val: # ESC
         return ESC_CHAR_MAP[val]
@@ -81,7 +81,7 @@ class TypeDef(ASTNode):
     def __hash__(self) -> int:
         return hash((self.location.fileid, self.name))
 
-    def __eq__(self, other) -> bool:
+    def __eq__(self, other: object) -> bool:
         return (
             isinstance(other, TypeDef) and
             self.location.fileid == other.location.fileid and
@@ -118,7 +118,7 @@ class FieldDef(ASTNode):
         self.attributes = attributes
 
     @property
-    def fixed(self):
+    def fixed(self) -> bool:
         return self.attributes.get('fixed', False)
 
 class Section(ASTNode):
@@ -128,8 +128,8 @@ class StructDef(TypeDef):
     fields:   Dict[str, FieldDef] # OrderedDict
     sections: List[Section]
 
-    def __init__(self, name: str, location: Span, fields: Dict[str, FieldDef] = None,
-                 size: Optional[int] = None, sections: List[Section] = None):
+    def __init__(self, name: str, location: Span, fields: Optional[Dict[str, FieldDef]] = None,
+                 size: Optional[int] = None, sections: Optional[List[Section]] = None):
         super().__init__(name, size, location)
         self.fields   = fields if fields is not None else OrderedDict()
         self.sections = sections if sections is not None else []
@@ -187,7 +187,7 @@ class Expr(ASTNode):
     def get_type_def(self, parser: "Parser", module: "Module", context: Optional[StructDef]) -> TypeDef:
         raise NotImplementedError
 
-    def type_check(self, target: TypeDef, parser: "Parser", module: "Module", context: Optional[StructDef]):
+    def type_check(self, target: TypeDef, parser: "Parser", module: "Module", context: Optional[StructDef]) -> None:
         typedef = self.get_type_def(parser, module, context)
         if not is_assignable(typedef, target):
             raise BFDLTypeError(typedef.name, target.name, self.location)
@@ -599,7 +599,7 @@ class Attributes:
     defined_attrs: Dict[str, Attribute]
 
     def __init__(self,
-                 defined_attrs: Dict[str, Attribute] = None,
+                 defined_attrs: Optional[Dict[str, Attribute]] = None,
                  parent: Optional["Attributes"] = None):
         self.defined_attrs = defined_attrs or {}
         self.parent = parent
@@ -612,16 +612,16 @@ class Attributes:
             return self.defined_attrs[name]
         return self.parent[name]
 
-    def get(self, name: str, default=None):
+    def get(self, name: str, default: Any=None) -> Any:
         if name in self.defined_attrs:
-            return self.defined_attrs[name]
+            return self.defined_attrs[name].value
 
         if self.parent is not None and name in self.parent:
-            return self.parent[name]
+            return self.parent[name].value
 
         return default
 
-    def declare(self, attr: Attribute):
+    def declare(self, attr: Attribute) -> None:
         if attr.name in self.defined_attrs:
             other = self.defined_attrs[attr.name]
             raise AttributeRedeclaredError(attr.name, other.location, attr.location)
@@ -675,7 +675,7 @@ class Module:
         self.unfinished_refs = set()
         self.types           = dict(PRELUDE_TYPES)
 
-    def declare(self, name: str, typedef: TypeDef):
+    def declare(self, name: str, typedef: TypeDef) -> None:
         if name in self.types:
             raise TypeNameConflictError(name, typedef.location, self.types[name].location)
         self.declared_types[name] = self.types[name] = typedef
@@ -854,7 +854,7 @@ class Parser:
 
         return token
 
-    def _parse_module(self):
+    def _parse_module(self) -> None:
         while self._has_next(TOK.BANG):
             self._parse_file_attribute()
 
@@ -866,15 +866,17 @@ class Parser:
 
         # TODO: typecheck phase and calculate struct sizes
 
-    def _parse_file_attribute(self):
+    def _parse_file_attribute(self) -> None:
         self._expect(TOK.BANG)
         attr = self._parse_attribute()
         self._current_module.attributes.declare(attr)
 
-    def _parse_attribute(self):
+    def _parse_attribute(self) -> Attribute:
+        cur = self._cursor()
         self._expect(TOK.HASH)
         with self._expect_paren(TOK.CUR_OPEN):
             name_tok = self._expect(TOK.ID)
+            value: Union[Value, TypeRef, Identifier, None]
 
             if self._has_next(TOK.ASSIGN):
                 self._next_token()
@@ -888,11 +890,11 @@ class Parser:
             else:
                 value = None
 
-        attr = Attribute(name_tok.value, value, name_tok)
+        attr = Attribute(name_tok.value, value, self._span(cur))
         return attr
 
     @contextmanager
-    def _expect_paren(self, paren: TOK):
+    def _expect_paren(self, paren: TOK) -> Generator[Atom, None, None]:
         open_at  = self._cursor()
         open_tok = self._expect(paren)
         yield open_tok
@@ -933,15 +935,14 @@ class Parser:
 
         return fileid
 
-    def _parse_import(self):
+    def _parse_import(self) -> None:
         self._expect(TOK.IMPORT)
-        atom = self._peek_token()
 
-        if atom.tok == TOK.STR:
+        if self._has_next(TOK.STR):
             # import all types
-            module_filename = atom.parse_value()
-            fileid = self._queue_module(module_filename)
-            self._current_module.imports.append(Import(atom, fileid))
+            module_filename = self._parse_str()
+            fileid = self._queue_module(module_filename.value)
+            self._current_module.imports.append(Import(module_filename.location, fileid))
         else:
             # import only explicitely listed types
             import_map: Dict[str, ImportSymbol] = OrderedDict()
@@ -973,19 +974,18 @@ class Parser:
 
             self._expect(TOK.FROM)
 
-            atom = self._expect(TOK.STR)
-            module_filename = atom.parse_value()
-            fileid = self._queue_module(module_filename)
-            self._current_module.imports.append(Import(atom, fileid, import_map))
+            module_filename = self._parse_str()
+            fileid = self._queue_module(module_filename.value)
+            self._current_module.imports.append(Import(module_filename.location, fileid, import_map))
 
         self._expect(TOK.SEMICOL)
 
-    def _parse_id(self):
+    def _parse_id(self) -> Identifier:
         cur  = self._cursor()
         atom = self._expect(TOK.ID)
         return Identifier(atom.value, self._span(cur))
 
-    def _parse_struct_def(self):
+    def _parse_struct_def(self) -> None:
         cur = self._cursor()
         attrs = Attributes(parent=self._current_module.attributes)
         while self._has_next(TOK.HASH):
@@ -999,10 +999,10 @@ class Parser:
         if name in self._current_module.declared_types:
             raise TypeNameConflictError(name, name_id.location, self._current_module.types[name].location)
 
-        fields   = OrderedDict()
-        stack    = []
-        section  = None
-        sections = []
+        fields: Dict[str, FieldDef] = OrderedDict()
+        stack: List[Expr] = []
+        section: Optional[UnconditionalSection] = None
+        sections: List[Section] = []
 
         with self._expect_paren(TOK.CUR_OPEN):
             while True:
@@ -1027,11 +1027,11 @@ class Parser:
         struct_def = StructDef(name, self._span(cur), fields, None, sections)
         self._current_module.declare(name, struct_def)
 
-    def _parse_conditional_section(self, fields: Dict[str, FieldDef], stack: List[Expr]):
+    def _parse_conditional_section(self, fields: Dict[str, FieldDef], stack: List[Expr]) -> ConditionalSection:
         cur = self._cursor()
         self._expect(TOK.IF)
-        sections = []
-        section  = None
+        sections: List[Section] = []
+        section: Optional[UnconditionalSection] = None
 
         with self._expect_paren(TOK.PAR_OPEN):
             condition = self._parse_expr()
@@ -1059,7 +1059,8 @@ class Parser:
 
         return ConditionalSection(condition, sections, self._span(cur))
 
-    def _parse_field_def(self):
+    def _parse_field_def(self) -> FieldDef:
+        cur = self._cursor()
         attrs = Attributes()
         while self._has_next(TOK.HASH):
             attr = self._parse_attribute()
@@ -1072,6 +1073,7 @@ class Parser:
             optional = True
         name_tok = self._expect(TOK.ID)
 
+        value: Optional[Value]
         if self._has_next(TOK.ASSIGN):
             self._next_token()
             value = self._parse_value()
@@ -1080,26 +1082,29 @@ class Parser:
 
         self._expect(TOK.SEMICOL)
 
-        return FieldDef(name_tok.name, type_ref, value, optional, attrs, name_tok)
+        return FieldDef(name_tok.value, type_ref, value, optional, attrs, self._span(cur))
 
-    def _parse_type_ref(self):
+    def _parse_type_ref(self) -> TypeRef:
+        cur = self._cursor()
         name_tok = self._expect(TOK.ID)
-        type_ref = TypeRef(name_tok.value, name_tok)
+        type_ref = TypeRef(name_tok.value, cur.to_span())
 
         while self._has_next(TOK.BR_OPEN):
             with self._expect_paren(TOK.BR_OPEN):
+                size: Optional[Expr]
                 if not self._has_next(TOK.BR_CLOSE):
                     size = self._parse_expr()
                 else:
                     size = None
-            type_ref = ArrayTypeRef(type_ref, size, name_tok)
+            type_ref = ArrayTypeRef(type_ref, size, self._span(cur))
 
         return type_ref
 
-    def _parse_int(self):
+    def _parse_int(self) -> Integer:
         cur   = self._cursor()
         token = self._expect(TOK.INT)
         match = R_INT.match(token.value)
+        assert match
         signed_char = match.group(5)
         str_bits    = match.group(6)
         signed      = signed_char == 'i'
@@ -1132,21 +1137,22 @@ class Parser:
 
         return Integer(value, typedef, cur.to_span())
 
-    def _parse_str(self):
+    def _parse_str(self) -> String:
         cur   = self._cursor()
         token = self._expect(TOK.STR)
 
         match = R_STR.match(token.value)
+        assert match
         if match.group(1):
             raise TypeError(f"illegal string prefix: {token.value}")
         value = R_STR_ELEM.sub(_replace_str_elem, match.group(2))
         return String(value, cur.to_span())
 
-    def _parse_byte(self):
+    def _parse_byte(self) -> Integer:
         cur   = self._cursor()
         token = self._expect(TOK.BYTE)
 
-        val = self.value[1:-1]
+        val = token.value[1:-1]
         if val.startswith('\\x'):
             value = int(val[2:], 16)
 
@@ -1158,7 +1164,62 @@ class Parser:
 
         return Integer(value, BYTE, cur.to_span())
 
-    def _parse_value(self):
+    def _parse_float(self) -> Float:
+        cur = self._cursor()
+        token = self._expect(TOK.FLOAT)
+
+        match    = R_FLOAT.match(token.value)
+        assert match
+        val      = match.group(1)
+        str_bits = match.group(2)
+        bits     = int(str_bits) if str_bits is not None else None
+
+        value = float(val)
+
+        if bits is None:
+            typedef = None
+        else:
+            typedef = FLOATS[bits]
+
+        return Float(value, typedef, cur.to_span())
+
+    def _parse_bool(self) -> Bool:
+        cur = self._cursor()
+        token = self._expect(TOK.BOOL)
+        return Bool(token.value == 'true', cur.to_span())
+
+    def _parse_bytes(self) -> ArrayLiteral:
+        cur = self._cursor()
+        token = self._expect(TOK.BYTES)
+        match = R_BYTES.match(token.value)
+        assert match
+        body = match.group(1)
+        buf = bytearray()
+        index = 0
+        end = len(body)
+        while index < end:
+            match = R_BYTES_ELEM.match(body, index)
+            assert match
+            val = match.group(1) # HEX
+            if val:
+                buf.append(int(val[2:], 16))
+            else:
+                val = match.group(2) # ESC
+                if val:
+                    buf.append(ESC_BYTE_MAP[val])
+                else:
+                    val = match.group(3) # CHAR
+                    buf.append(ord(val))
+            index = match.end()
+        value = bytes(buf)
+
+        return ArrayLiteral(
+            value,
+            ArrayTypeRef(TypeRef(BYTE.name, cur.to_span()), Integer(len(value), UINT64, cur.to_span()), cur.to_span()),
+            self._span(cur))
+
+
+    def _parse_value(self) -> Value:
         if self._has_next(TOK.INT):
             return self._parse_int()
 
@@ -1166,54 +1227,45 @@ class Parser:
             return self._parse_byte()
 
         elif self._has_next(TOK.FLOAT):
-            token = self._next_token()
-            value, bits = token.parse_value()
-            if bits is None:
-                typedef = None
-            else:
-                typedef = FLOATS[bits]
-
-            return Float(value, typedef, token)
+            return self._parse_float()
 
         elif self._has_next(TOK.BOOL):
-            token = self._next_token()
-            return Bool(token.parse_value(), token)
+            return self._parse_bool()
 
         elif self._has_next(TOK.STR):
             self._parse_str()
 
         elif self._has_next(TOK.BYTES):
-            token = self._next_token()
-            value = token.parse_value()
-            return ArrayLiteral(value, ArrayTypeRef(TypeRef(BYTE.name, token), len(value), token), token)
+            return self._parse_bytes()
 
         elif self._has_next(TOK.NULL):
-            token = self._next_token()
-            return Null(token)
+            cur = self._cursor()
+            self._next_token()
+            return Null(cur.to_span())
 
         type_ref = self._parse_type_ref()
 
         with self._expect_paren(TOK.BR_OPEN):
             if isinstance(type_ref, ArrayTypeRef):
-                items = []
+                array_items = []
                 # parse array literal
                 while not self._has_next(TOK.CUR_CLOSE):
                     value = self._parse_value()
-                    items.append(value)
+                    array_items.append(value)
 
                     if self._has_next(TOK.SEMICOL):
                         self._next_token()
                     else:
                         break
 
-                value = ArrayLiteral(items, type_ref, type_ref.location)
+                value = ArrayLiteral(array_items, type_ref, type_ref.location)
             else:
                 items: Dict[str, Tuple[Identifier, Value]] = OrderedDict()
                 # parse struct literal
                 while not self._has_next(TOK.CUR_CLOSE):
                     key = self._parse_id()
                     if key.name in items:
-                        raise FieldRedefinedError(key, key.location, items[key][0].location)
+                        raise FieldRedefinedError(key.name, key.location, items[key.name][0].location)
 
                     self._expect(TOK.COLON)
                     value = self._parse_value()
@@ -1228,10 +1280,10 @@ class Parser:
 
         return value
 
-    def _parse_expr(self):
+    def _parse_expr(self) -> Expr:
         return self._parse_cond_expr()
 
-    def _parse_cond_expr(self):
+    def _parse_cond_expr(self) -> Expr:
         expr = self._parse_or_expr()
 
         while self._has_next(TOK.QUEST):
@@ -1243,7 +1295,7 @@ class Parser:
 
         return expr
 
-    def _parse_or_expr(self):
+    def _parse_or_expr(self) -> Expr:
         expr = self._parse_and_expr()
         while self._has_next(TOK.OR):
             self._next_token()
@@ -1251,7 +1303,7 @@ class Parser:
             expr = BinaryExpr(expr, rhs, TOK.OR, expr.location)
         return expr
 
-    def _parse_and_expr(self):
+    def _parse_and_expr(self) -> Expr:
         expr = self._parse_bit_or_expr()
         while self._has_next(TOK.AND):
             self._next_token()
@@ -1259,7 +1311,7 @@ class Parser:
             expr = BinaryExpr(expr, rhs, TOK.AND, expr.location)
         return expr
 
-    def _parse_bit_or_expr(self):
+    def _parse_bit_or_expr(self) -> Expr:
         expr = self._parse_xor_expr()
         while self._has_next(TOK.BOR):
             self._next_token()
@@ -1267,7 +1319,7 @@ class Parser:
             expr = BinaryExpr(expr, rhs, TOK.BOR, expr.location)
         return expr
 
-    def _parse_xor_expr(self):
+    def _parse_xor_expr(self) -> Expr:
         expr = self._parse_bit_and_expr()
         while self._has_next(TOK.XOR):
             self._next_token()
@@ -1275,7 +1327,7 @@ class Parser:
             expr = BinaryExpr(expr, rhs, TOK.XOR, expr.location)
         return expr
 
-    def _parse_bit_and_expr(self):
+    def _parse_bit_and_expr(self) -> Expr:
         expr = self._parse_eq_expr()
         while self._has_next(TOK.BAND):
             self._next_token()
@@ -1283,7 +1335,7 @@ class Parser:
             expr = BinaryExpr(expr, rhs, TOK.BAND, expr.location)
         return expr
 
-    def _parse_eq_expr(self):
+    def _parse_eq_expr(self) -> Expr:
         expr = self._parse_rel_expr()
         while self._has_next(TOK.EQ) or self._has_next(TOK.NE):
             operator = self._next_token()
@@ -1291,7 +1343,7 @@ class Parser:
             expr = BinaryExpr(expr, rhs, operator.token, expr.location)
         return expr
 
-    def _parse_rel_expr(self):
+    def _parse_rel_expr(self) -> Expr:
         expr = self._parse_shift_expr()
         while self._has_next(TOK.LT) or self._has_next(TOK.GT) or self._has_next(TOK.LE) or self._has_next(TOK.GE):
             operator = self._next_token()
@@ -1299,7 +1351,7 @@ class Parser:
             expr = BinaryExpr(expr, rhs, operator.token, expr.location)
         return expr
 
-    def _parse_shift_expr(self):
+    def _parse_shift_expr(self) -> Expr:
         expr = self._parse_add_expr()
         while self._has_next(TOK.LSHIFT) or self._has_next(TOK.RSHIFT):
             operator = self._next_token()
@@ -1307,7 +1359,7 @@ class Parser:
             expr = BinaryExpr(expr, rhs, operator.token, expr.location)
         return expr
 
-    def _parse_add_expr(self):
+    def _parse_add_expr(self) -> Expr:
         expr = self._parse_mul_expr()
         while self._has_next(TOK.ADD) or self._has_next(TOK.SUB):
             operator = self._next_token()
@@ -1315,7 +1367,7 @@ class Parser:
             expr = BinaryExpr(expr, rhs, operator.token, expr.location)
         return expr
 
-    def _parse_mul_expr(self):
+    def _parse_mul_expr(self) -> Expr:
         expr = self._parse_unary_expr()
         while self._has_next(TOK.MUL) or self._has_next(TOK.DIV) or self._has_next(TOK.MOD):
             operator = self._next_token()
@@ -1323,20 +1375,22 @@ class Parser:
             expr = BinaryExpr(expr, rhs, operator.token, expr.location)
         return expr
 
-    def _parse_unary_expr(self):
+    def _parse_unary_expr(self) -> Expr:
         if self._has_next(TOK.SUB) or self._has_next(TOK.BANG) or self._has_next(TOK.BNOT):
+            cur = self._cursor()
             operator = self._next_token()
             expr = self._parse_unary_expr()
-            return UnaryExpr(operator.token, expr, operator)
+            return UnaryExpr(operator.token, expr, self._span(cur))
 
         if self._has_next(TOK.RAISE):
+            cur = self._cursor()
             token = self._next_token()
-            msg_tok = self._expect(TOK.STR)
-            return RaiseExpr(String(msg_tok.value, msg_tok), token)
+            msg = self._parse_str()
+            return RaiseExpr(msg, self._span(cur))
 
         return self._parse_postfix_expr()
 
-    def _parse_postfix_expr(self):
+    def _parse_postfix_expr(self) -> Expr:
         expr = self._parse_primary_expr()
         while self._has_next(TOK.DOT) or self._has_next(TOK.BR_OPEN):
             if self._has_next(TOK.DOT):
@@ -1349,7 +1403,7 @@ class Parser:
                 expr = ArrayItemAccessExpr(expr, item, expr.location)
         return expr
 
-    def _parse_primary_expr(self):
+    def _parse_primary_expr(self) -> Expr:
         if self._has_next(TOK.ID):
             return self._parse_id()
 
@@ -1360,8 +1414,8 @@ class Parser:
 
         return self._parse_value()
 
-def parse_file(filename: str, root_path: str = '.'):
+def parse_file(filename: str, root_path: str = '.') -> Module:
     return Parser(root_path).parse_file(abspath(filename))
 
-def parse_string(source: str, filename: str = '-', root_path: str = '.'):
+def parse_string(source: str, filename: str = '-', root_path: str = '.') -> Module:
     return Parser(root_path).parse_string(source, filename)

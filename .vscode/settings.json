@@ -4,6 +4,12 @@
 	"python.linting.flake8Enabled": false,
 	"python.linting.mypyEnabled": true,
 	"python.linting.mypyPath": "/home/panzi/.pythonbrew/versions/3.7.3/bin/mypy",
+	"python.linting.mypyArgs": [
+		"--ignore-missing-imports",
+		"--follow-imports=silent",
+		"--show-column-numbers",
+		"--strict"
+	],
 
 	"[python]": {
 		"editor.tabSize": 4,

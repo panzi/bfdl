@@ -2,6 +2,7 @@
 
 import re
 from collections import OrderedDict
+from typing import Generator, Iterable
 from .errors import IllegalTokenError
 from .atom import Atom
 from .tokens import TOK, IGNORABLE
@@ -79,7 +80,7 @@ TOKENIZER = re.compile(
     re.M | re.U
 )
 
-def tokenize(source: str, fileid: int = -1):
+def tokenize(source: str, fileid: int = -1) -> Generator[Atom, None, None]:
     index  = 0
     lineno = 1
     column = 1
@@ -115,7 +116,7 @@ def tokenize(source: str, fileid: int = -1):
 
         index = end_index
 
-def print_atoms(atoms):
+def print_atoms(atoms: Iterable[Atom]) -> None:
     for atom in atoms:
         print('%4d,%3d ... %4d,%3d: %-10s %r' % (
             atom.start_lineno, atom.start_column,
