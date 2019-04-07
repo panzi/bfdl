@@ -108,7 +108,7 @@ MulExpr ::= UnaryExpr
           | MulExpr "/" UnaryExpr
           | MulExpr "%" UnaryExpr
 
-UnaryExpr ::= PostfixExpr | UnaryOp UnaryExpr | "raise" String
+UnaryExpr ::= UnaryOp UnaryExpr | "raise" String | PostfixExpr
 
 PostfixExpr ::= PrimaryExpr
               | PostfixExpr "." Identifier
