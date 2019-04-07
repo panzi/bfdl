@@ -119,3 +119,13 @@ class UnbalancedParanthesesError(ParserError):
         super().__init__(message or f'expected {CLOSE_PARENS[open_token].value}, but got {close_token.value}')
         self.open_token  = open_token
         self.close_token = close_token
+
+class BFDLTypeError(BFDLError):
+    location: Atom
+    source: str
+    target: str
+
+    def __init__(self, source: str, target: str, location: Atom, message: Optional[str]=None):
+        super().__init__(message or f"{source} is not assignable to {target}")
+        self.source = source
+        self.target = target

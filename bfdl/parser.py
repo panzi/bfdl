@@ -13,7 +13,7 @@ from .errors import (
     UnexpectedEndOfFileError, ParserError, IllegalTokenError, AttributeRedeclaredError,
     UnbalancedParanthesesError, TypeNameConflictError, IllegalImportError, FieldRedeclaredError,
     FieldRedefinedError, TypeUnificationError, UndeclaredTypeError, IllegalReferenceError,
-    FieldAccessError, ItemAccessError,
+    FieldAccessError, ItemAccessError, BFDLTypeError,
 )
 
 class ASTNode:
@@ -101,15 +101,20 @@ def unify_types(lhs: TypeDef, rhs: TypeDef) -> Optional[TypeDef]:
 
     return None
 
+def is_assignable(source: TypeDef, target: TypeDef) -> bool:
+    raise NotImplementedError # TODO
+
 class Expr(ASTNode):
     def get_type_def(self, parser: "Parser", module: "Module", context: Optional[StructDef]) -> TypeDef:
         raise NotImplementedError
 
-    def type_check(self, typedef: TypeDef):
-        raise NotImplementedError
+    def type_check(self, target: TypeDef, parser: "Parser", module: "Module", context: Optional[StructDef]):
+        typedef = self.get_type_def(parser, module, context)
+        if not is_assignable(typedef, target):
+            raise BFDLTypeError(typedef.name, target.name, self.location)
 
     def fold(self) -> "Expr":
-        raise NotImplementedError
+        return self
 
 class ConditionalExpr(Expr):
     condition:  Expr
@@ -129,6 +134,8 @@ class ConditionalExpr(Expr):
         if typedef is None:
             raise TypeUnificationError(self.true_expr.location, self.false_expr.location, true_type, false_type)
         return typedef
+
+    
 
 COMPARE_OPS = frozenset((
     TOK.EQ, TOK.NE, TOK.LT, TOK.GT, TOK.LE, TOK.GE,
@@ -199,7 +206,7 @@ class Identifier(Expr):
 
         field = context.fields[self.name]
         typedef = field.type_ref.resolve(parser, module)
-        if field.optional:
+        if not isinstance(typedef, NullableType) and (field.optional and field.default is None) or isinstance(field.default, Null):
             typedef = NullableType(typedef, field.type_ref.location)
         return typedef
 
@@ -225,7 +232,8 @@ class FieldAccessExpr(PostfixExpr):
         if self.field.name not in struct_def.fields:
             raise IllegalReferenceError(self.field.name, self.field.location)
 
-        typedef = struct_def.fields[self.field.name]
+        field = struct_def.fields[self.field.name]
+        typedef = field.type_ref.resolve(parser, module)
 
         if nullable and not isinstance(typedef, NullableType):
             typedef = NullableType(typedef, self.field.location)
