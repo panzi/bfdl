@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 
+import re
 from collections import OrderedDict
 from contextlib import contextmanager
 from typing import List, Optional, Iterator, Dict, Union, Set, Tuple, Any
 from os.path import abspath, join as join_path, dirname
 from enum import Enum
 
-from .tokens import TOK
+from .tokens import TOK, CLOSE_PARENS
 from .tokenizer import tokenize
 from .atom import Atom
+from .cursor import Cursor, Span, make_span
 from .errors import (
     UnexpectedEndOfFileError, ParserError, IllegalTokenError, AttributeRedeclaredError,
     UnbalancedParanthesesError, TypeNameConflictError, IllegalImportError, FieldRedeclaredError,
@@ -16,17 +18,62 @@ from .errors import (
     FieldAccessError, ItemAccessError, BFDLTypeError,
 )
 
-class ASTNode:
-    location: Atom
+HEX = r'\\x[0-9a-fA-F]{2}'
+ESC = r'\\["ntrvfb\\]'
+UNI = r'\\u[0-9a-fA-F]{4}|\\U[0-9a-fA-F]{6}'
 
-    def __init__(self, location: Atom):
+R_STR = re.compile(
+    rf'^(\b[^a-zA-Z]+)?"((?:[^"\n\\]|{HEX}|{ESC}|{UNI})*)"',
+    re.M | re.U)
+
+R_STR_ELEM = re.compile(rf'({ESC})|({HEX}|{UNI})', re.M | re.U)
+
+R_BYTES = re.compile(rf'\bb"((?:[^"\n\\]|{HEX}|{ESC})*)"', re.M | re.U)
+
+R_BYTES_ELEM = re.compile(rf'({HEX})|({ESC})|(.)', re.M | re.U)
+
+R_INT = re.compile(
+    r'^(?:([-+]?[0-9]+)|([-+]?0x[0-9a-fA-F]+)|([-+]?0o[0-7]+)|([-+]?0b[0-1]+))(?:([ui])(8|16|32|64)\b)?$',
+    re.M | re.U)
+
+R_FLOAT = re.compile(
+    r'([-+]?[0-9]+(?:\.[0-9]+|[eE][-+]?[0-9]+))(?:f(32|64)\b)?',
+    re.M | re.U)
+
+ESC_CHAR_MAP = {
+    '\\n': '\n',
+    '\\t': '\t',
+    '\\r': '\r',
+    '\\v': '\v',
+    '\\f': '\f',
+    '\\b': '\b',
+    '\\"': '"',
+    "\\'": "'",
+    '\\\\': '\\',
+}
+
+ESC_BYTE_MAP = dict((esc, ord(char)) for esc, char in ESC_CHAR_MAP.items())
+
+def _replace_str_elem(match):
+    val = match.group(1)
+    if val: # ESC
+        return ESC_CHAR_MAP[val]
+
+    # HEX / UNI
+    val = match.group(2)
+    return chr(int(val[2:], 16))
+
+class ASTNode:
+    location: Span
+
+    def __init__(self, location: Span):
         self.location = location
 
 class TypeDef(ASTNode):
     name: str
     size: Optional[int]
 
-    def __init__(self, name: str, size: Optional[int], location: Atom):
+    def __init__(self, name: str, size: Optional[int], location: Span):
         super().__init__(location)
         self.name = name
         self.size = size
@@ -34,8 +81,9 @@ class TypeDef(ASTNode):
     def __hash__(self) -> int:
         return hash((self.location.fileid, self.name))
 
-    def __eq__(self, other: TypeDef) -> bool:
+    def __eq__(self, other) -> bool:
         return (
+            isinstance(other, TypeDef) and
             self.location.fileid == other.location.fileid and
             self.name == other.name
         )
@@ -43,7 +91,7 @@ class TypeDef(ASTNode):
 class TypeRef(ASTNode):
     name: str
 
-    def __init__(self, name: str, location: Atom):
+    def __init__(self, name: str, location: Span):
         super().__init__(location)
         self.name = name
 
@@ -51,6 +99,40 @@ class TypeRef(ASTNode):
         if self.name not in module.types:
             raise UndeclaredTypeError(self.name, self.location)
         return module.types[self.name]
+
+class FieldDef(ASTNode):
+    name:       str
+    type_ref:   TypeRef
+    optional:   bool
+    default:    Optional["Value"]
+    attributes: "Attributes"
+
+    def __init__(self, name: str, type_ref: TypeRef,
+                 default: Optional["Value"], optional: bool,
+                 attributes: "Attributes", location: Span):
+        super().__init__(location)
+        self.name       = name
+        self.type_ref   = type_ref
+        self.optional   = optional
+        self.default    = default
+        self.attributes = attributes
+
+    @property
+    def fixed(self):
+        return self.attributes.get('fixed', False)
+
+class Section(ASTNode):
+    pass
+
+class StructDef(TypeDef):
+    fields:   Dict[str, FieldDef] # OrderedDict
+    sections: List[Section]
+
+    def __init__(self, name: str, location: Span, fields: Dict[str, FieldDef] = None,
+                 size: Optional[int] = None, sections: List[Section] = None):
+        super().__init__(name, size, location)
+        self.fields   = fields if fields is not None else OrderedDict()
+        self.sections = sections if sections is not None else []
 
 def unify_types(lhs: TypeDef, rhs: TypeDef) -> Optional[TypeDef]:
     if lhs is rhs:
@@ -62,18 +144,15 @@ def unify_types(lhs: TypeDef, rhs: TypeDef) -> Optional[TypeDef]:
     if rhs is NEVER:
         return lhs
 
-    lhs_nullable = isinstance(lhs, NullableType)
-    rhs_nullable = isinstance(rhs, NullableType)
-
-    if lhs_nullable and rhs_nullable:
+    if isinstance(lhs, NullableType) and isinstance(rhs, NullableType):
         typedef = unify_types(lhs.typedef, rhs.typedef)
         return NullableType(typedef) if typedef is not None else None
 
-    if lhs_nullable:
+    if isinstance(lhs, NullableType):
         typedef = unify_types(lhs.typedef, rhs)
         return NullableType(typedef) if typedef is not None else None
 
-    if rhs_nullable:
+    if isinstance(rhs, NullableType):
         typedef = unify_types(lhs, rhs.typedef)
         return NullableType(typedef) if typedef is not None else None
 
@@ -121,7 +200,7 @@ class ConditionalExpr(Expr):
     true_expr:  Expr
     false_expr: Expr
 
-    def __init__(self, condition: Expr, true_expr: Expr, false_expr: Expr, location: Atom):
+    def __init__(self, condition: Expr, true_expr: Expr, false_expr: Expr, location: Span):
         super().__init__(location)
         self.condition  = condition
         self.true_expr  = true_expr
@@ -132,10 +211,9 @@ class ConditionalExpr(Expr):
         false_type = self.false_expr.get_type_def(parser, module, context)
         typedef = unify_types(true_type, false_type)
         if typedef is None:
-            raise TypeUnificationError(self.true_expr.location, self.false_expr.location, true_type, false_type)
+            raise TypeUnificationError(self.true_expr.location, self.false_expr.location,
+                                       true_type.name, false_type.name)
         return typedef
-
-    
 
 COMPARE_OPS = frozenset((
     TOK.EQ, TOK.NE, TOK.LT, TOK.GT, TOK.LE, TOK.GE,
@@ -160,13 +238,13 @@ class BinaryExpr(Expr):
     rhs: Expr
     op:  TOK
 
-    def __init__(self, lhs: Expr, rhs: Expr, op: TOK, location: Atom):
+    def __init__(self, lhs: Expr, rhs: Expr, op: TOK, location: Span):
         super().__init__(location)
         self.lhs = lhs
         self.rhs = rhs
         self.op  = op
 
-    def get_type_def(self, parser: "Parser", module: "Module", context: Optional[StructDef]) -> TypeDef:
+    def get_type_def(self, parser: "Parser", module: "Module", context: Optional["StructDef"]) -> TypeDef:
         if self.op in BOOL_RES_OPS:
             return BOOL
 
@@ -174,14 +252,15 @@ class BinaryExpr(Expr):
         rhs_type = self.rhs.get_type_def(parser, module, context)
         typedef = unify_types(lhs_type, rhs_type)
         if typedef is None:
-            raise TypeUnificationError(self.lhs.location, self.rhs.location, lhs_type, rhs_type)
+            raise TypeUnificationError(self.lhs.location, self.rhs.location,
+                                       lhs_type.name, rhs_type.name)
         return typedef
 
 class UnaryExpr(Expr):
     op:   TOK
     expr: Expr
 
-    def __init__(self, op: TOK, expr: Expr, location: Atom):
+    def __init__(self, op: TOK, expr: Expr, location: Span):
         super().__init__(location)
         self.op   = op
         self.expr = expr
@@ -196,7 +275,7 @@ class PostfixExpr(Expr):
 class Identifier(Expr):
     name: str
 
-    def __init__(self, name: str, location: Atom):
+    def __init__(self, name: str, location: Span):
         super().__init__(location)
         self.name = name
 
@@ -206,7 +285,8 @@ class Identifier(Expr):
 
         field = context.fields[self.name]
         typedef = field.type_ref.resolve(parser, module)
-        if not isinstance(typedef, NullableType) and (field.optional and field.default is None) or isinstance(field.default, Null):
+        if not isinstance(typedef, NullableType) and (
+                (field.optional and field.default is None) or isinstance(field.default, Null)):
             typedef = NullableType(typedef, field.type_ref.location)
         return typedef
 
@@ -214,7 +294,7 @@ class FieldAccessExpr(PostfixExpr):
     expr:  Expr
     field: Identifier
 
-    def __init__(self, expr: Expr, field: Identifier, location: Atom):
+    def __init__(self, expr: Expr, field: Identifier, location: Span):
         super().__init__(location)
         self.expr  = expr
         self.field = field
@@ -222,9 +302,11 @@ class FieldAccessExpr(PostfixExpr):
     def get_type_def(self, parser: "Parser", module: "Module", context: Optional[StructDef]) -> TypeDef:
         struct_def = self.expr.get_type_def(parser, module, context)
 
-        nullable = isinstance(struct_def, NullableType)
-        if nullable:
+        if isinstance(struct_def, NullableType):
             struct_def = struct_def.typedef
+            nullable = True
+        else:
+            nullable = False
 
         if not isinstance(struct_def, StructDef):
             raise FieldAccessError(self.field.name, self.field.location)
@@ -244,7 +326,7 @@ class ArrayItemAccessExpr(PostfixExpr):
     array: Expr
     item:  Expr
 
-    def __init__(self, array: Expr, item: Expr, location: Atom):
+    def __init__(self, array: Expr, item: Expr, location: Span):
         super().__init__(location)
         self.array = array
         self.item  = item
@@ -252,11 +334,13 @@ class ArrayItemAccessExpr(PostfixExpr):
     def get_type_def(self, parser: "Parser", module: "Module", context: Optional[StructDef]) -> TypeDef:
         array_def = self.array.get_type_def(parser, module, context)
 
-        nullable = isinstance(array_def, NullableType)
-        if nullable:
+        if isinstance(array_def, NullableType):
             array_def = array_def.typedef
+            nullable = True
+        else:
+            nullable = False
 
-        if not isinstance(array_def, StructDef):
+        if not isinstance(array_def, ArrayTypeDef):
             raise ItemAccessError(self.item.location)
 
         typedef = array_def.items
@@ -270,7 +354,7 @@ class ArrayTypeRef(TypeRef):
     item_ref: TypeRef
     count:    Optional[Expr]
 
-    def __init__(self, item_ref: TypeRef, count: Optional[Expr], location: Atom):
+    def __init__(self, item_ref: TypeRef, count: Optional[Expr], location: Span):
         if count is None or not isinstance(count, Integer):
             count_val = None
         else:
@@ -291,9 +375,10 @@ class ArrayTypeRef(TypeRef):
 
 class PrimitiveType(TypeDef):
     pytype: type
+    size:   int
 
-    def __init__(self, pytype: type, size: int, name: str, location: Optional[Atom] = None):
-        super().__init__(name, size, location or Atom(0, 0, 0, 0, 0, TOK.TYPE, name))
+    def __init__(self, pytype: type, size: int, name: str, location: Optional[Span] = None):
+        super().__init__(name, size, location or Span(0, 0, 0))
         self.pytype = pytype
 
 UINT8  = PrimitiveType(int,   1, "uint8")
@@ -320,17 +405,17 @@ UNSIGNED_INTS = {8: UINT8, 16: UINT16, 32: UINT32, 64: UINT64}
 FLOATS = {32: FLOAT, 64: DOUBLE}
 
 class NeverType(TypeDef):
-    def __init__(self, name: str, location: Optional[Atom] = None):
-        super().__init__(name, 0, location or Atom(0, 0, 0, 0, 0, TOK.TYPE, name))
+    def __init__(self, name: str, location: Optional[Span] = None):
+        super().__init__(name, 0, location or Span(0, 0, 0))
 
 NEVER = NeverType('never')
 
 class NullableType(TypeDef):
     typedef: TypeDef
 
-    def __init__(self, typedef: TypeDef, location: Optional[Atom] = None):
+    def __init__(self, typedef: TypeDef, location: Optional[Span] = None):
         name = typedef.name + '?'
-        super().__init__(name, typedef.size, location or Atom(0, 0, 0, 0, 0, TOK.TYPE, name))
+        super().__init__(name, typedef.size, location or Span(0, 0, 0))
         self.typedef = typedef
 
 NULL = NullableType(NEVER)
@@ -338,7 +423,7 @@ NULL = NullableType(NEVER)
 class StringType(TypeDef):
     pass
 
-STRING = StringType("string", None, Atom(0, 0, 0, 0, 0, TOK.TYPE, "string"))
+STRING = StringType("string", None, Span(0, 0, 0))
 
 class Value(Expr):
     value: Any
@@ -354,38 +439,64 @@ class PrimitiveValue(AtomicValue):
     value: Union[int, float, bool]
     typedef: Optional[TypeDef]
 
-    def __init__(self, typedef: Optional[TypeDef], location: Atom):
+    def __init__(self, typedef: Optional[TypeDef], location: Span):
         super().__init__(location)
         self.typedef = typedef
 
     def get_type_def(self, parser: "Parser", module: "Module", context: Optional[StructDef]) -> TypeDef:
+        if self.typedef is None:
+            value = self.value
+            if isinstance(value, int):
+                if value <= 0x7F and value >= -0x80:
+                    return INT8
+
+                if value <= 0x7FFF and value >= -0x8000:
+                    return INT16
+
+                if value <= 0x7FFFFFFF and value >= -0x80000000:
+                    return INT32
+
+                if value <= 0x7FFFFFFFFFFFFFFF and value >= -0x8000000000000000:
+                    return INT64
+
+                if value <= 0xFFFFFFFFFFFFFFFF and value >= 0:
+                    return UINT64
+
+                raise ValueError(f"integer out of bounds: {value}") # TODO: propper error class
+
+            if isinstance(value, float):
+                return DOUBLE
+
+            assert isinstance(value, bool)
+            return BOOL
+
         return self.typedef
 
 class Integer(PrimitiveValue):
     value: int
 
-    def __init__(self, value: int, typedef: Optional[TypeDef], location: Atom):
+    def __init__(self, value: int, typedef: Optional[TypeDef], location: Span):
         super().__init__(typedef, location)
         self.value = value
 
 class Float(PrimitiveValue):
     value: float
 
-    def __init__(self, value: float, typedef: Optional[TypeDef], location: Atom):
+    def __init__(self, value: float, typedef: Optional[TypeDef], location: Span):
         super().__init__(typedef, location)
         self.value = value
 
 class Bool(PrimitiveValue):
     value: bool
 
-    def __init__(self, value: bool, location: Atom):
+    def __init__(self, value: bool, location: Span):
         super().__init__(BOOL, location)
         self.value = value
 
 class String(AtomicValue):
     value: str
 
-    def __init__(self, value: str, location: Atom):
+    def __init__(self, value: str, location: Span):
         super().__init__(location)
         self.value = value
 
@@ -395,7 +506,7 @@ class String(AtomicValue):
 class Null(AtomicValue):
     value: None
 
-    def __init__(self, location: Atom):
+    def __init__(self, location: Span):
         super().__init__(location)
         self.value = None
 
@@ -406,7 +517,7 @@ class ArrayLiteral(Value):
     value:    Union[List[Any], bytes]
     type_ref: ArrayTypeRef
 
-    def __init__(self, value: Union[List[Any], bytes], type_ref: ArrayTypeRef, location: Atom):
+    def __init__(self, value: Union[List[Any], bytes], type_ref: ArrayTypeRef, location: Span):
         super().__init__(location)
         self.value    = value
         self.type_ref = type_ref
@@ -418,7 +529,7 @@ class StructLiteral(Value):
     value: Dict[str, Tuple[Identifier, Value]]
     type_ref: TypeRef
 
-    def __init__(self, value: Dict[str, Tuple[Identifier, Value]], type_ref: TypeRef, location: Atom):
+    def __init__(self, value: Dict[str, Tuple[Identifier, Value]], type_ref: TypeRef, location: Span):
         super().__init__(location)
         self.value    = value
         self.type_ref = type_ref
@@ -429,41 +540,18 @@ class StructLiteral(Value):
 class RaiseExpr(Expr):
     message: String
 
-    def __init__(self, message: String, location: Atom):
+    def __init__(self, message: String, location: Span):
         super().__init__(location)
         self.message = message
 
     def get_type_def(self, parser: "Parser", module: "Module", context: Optional[StructDef]) -> TypeDef:
         return NEVER
 
-class FieldDef(ASTNode):
-    name:       str
-    type_ref:   TypeRef
-    optional:   bool
-    default:    Optional[Value]
-    attributes: "Attributes"
-
-    def __init__(self, location: Atom, name: str, type_ref: TypeRef,
-                 default: Optional[Value], optional: bool, attributes: "Attributes"):
-        super().__init__(location)
-        self.name       = name
-        self.type_ref   = type_ref
-        self.optional   = optional
-        self.default    = default
-        self.attributes = attributes
-
-    @property
-    def fixed(self):
-        return self.attributes.get('fixed', False)
-
-class Section(ASTNode):
-    pass
-
 class UnconditionalSection(Section):
     start_field_index: int
     field_count: int
 
-    def __init__(self, location: Atom, start_field_index: int, field_count: int):
+    def __init__(self, start_field_index: int, field_count: int, location: Span):
         super().__init__(location)
         self.start_field_index = start_field_index
         self.field_count = field_count
@@ -472,23 +560,14 @@ class ConditionalSection(Section):
     condition: Expr
     sections: List[Section]
 
-    def __init__(self, location: Atom, condition: Expr, sections: List[Section]):
+    def __init__(self, condition: Expr, sections: List[Section], location: Span):
         super().__init__(location)
         self.condition = condition
         self.sections  = sections
 
-class StructDef(TypeDef):
-    fields:   Dict[str, FieldDef] # OrderedDict
-    sections: List[Section]
-
-    def __init__(self, name: str, location: Atom, fields: Dict[str, FieldDef]=None,
-                 size: Optional[int]=None, sections: List[Section]=None):
-        super().__init__(name, size, location)
-        self.fields   = fields if fields is not None else OrderedDict()
-        self.sections = sections if sections is not None else []
-
 def _array_type_info(items: TypeDef, count: Optional[int]) -> Tuple[str, Optional[int]]:
     item_size = items.size
+    size: Optional[int]
     if item_size is not None and count is not None:
         size = item_size * count
     else:
@@ -500,7 +579,7 @@ class ArrayTypeDef(TypeDef):
     items: TypeDef
     count: Optional[int]
 
-    def __init__(self, items: TypeDef, count: Optional[int], location: Atom):
+    def __init__(self, items: TypeDef, count: Optional[int], location: Span):
         name, size = _array_type_info(items, count)
         super().__init__(name, size, location)
         self.items = items
@@ -508,9 +587,9 @@ class ArrayTypeDef(TypeDef):
 
 class Attribute(ASTNode):
     name: str
-    value: Union[Value | TypeRef | Identifier | None]
+    value: Union[Value, TypeRef, Identifier, None]
 
-    def __init__(self, name: str, value: Union[Value | TypeRef | Identifier | None], location: Atom):
+    def __init__(self, name: str, value: Union[Value, TypeRef, Identifier, None], location: Span):
         super().__init__(location)
         self.name  = name
         self.value = value
@@ -520,8 +599,8 @@ class Attributes:
     defined_attrs: Dict[str, Attribute]
 
     def __init__(self,
-                 defined_attrs: Dict[str, Attribute]=None,
-                 parent: Optional["Attributes"]=None):
+                 defined_attrs: Dict[str, Attribute] = None,
+                 parent: Optional["Attributes"] = None):
         self.defined_attrs = defined_attrs or {}
         self.parent = parent
 
@@ -548,16 +627,25 @@ class Attributes:
             raise AttributeRedeclaredError(attr.name, other.location, attr.location)
         self.defined_attrs[attr.name] = attr
 
-class Import(ASTNode):
-    fielid: int
-    import_map: Optional[Dict[str, Tuple[TOK, TOK]]]
+class ImportSymbol:
+    name: Identifier
+    mapped_name: Identifier
 
-    def __init__(self, location: Atom, fileid: int, import_map: Optional[Dict[str, (str, Atom)]]=None):
+    def __init__(self, name: Identifier, mapped_name: Optional[Identifier] = None):
+        self.name        = name
+        self.mapped_name = mapped_name or name
+
+class Import(ASTNode):
+    fileid: int
+    import_map: Optional[Dict[str, ImportSymbol]]
+
+    def __init__(self, location: Span, fileid: int, import_map: Optional[Dict[str, ImportSymbol]] = None):
         super().__init__(location)
-        self.fielid     = fileid
+        self.fileid     = fileid
         self.import_map = import_map
 
-PRELUDE_TYPES = PRIMITIVES | frozenset((STRING,))
+PRELUDE_TYPES: Dict[str, TypeDef] = dict(PRIMITIVES)
+PRELUDE_TYPES[STRING.name] = STRING
 
 class ModuleState(Enum):
     LOADING  = 0
@@ -569,17 +657,19 @@ class Module:
     filename:   str
     source:     str
     state:      ModuleState
+    tokens:     List[Atom]
     attributes: Attributes
     imports:    List[Import]
     unfinished_refs: Set[int] # fileids of modules that import this module
     types:           Dict[str, TypeDef] # prelude, imported and declared
     declared_types:  Dict[str, TypeDef]
 
-    def __init__(self, fileid: int, filename: str, source: str, attributes: Optional[Attributes]=None):
+    def __init__(self, fileid: int, filename: str, source: str, attributes: Optional[Attributes] = None):
         self.fileid          = fileid
         self.filename        = filename
         self.source          = source
         self.state           = ModuleState.LOADING
+        self.tokens          = []
         self.attributes      = attributes or Attributes()
         self.imports         = []
         self.unfinished_refs = set()
@@ -605,14 +695,14 @@ class Parser:
 
     def __init__(self, root_path: str = '.'):
         self._root_path      = abspath(root_path)
-        self._module_map     = {0: PRELUDE}
+        self._module_map     = {}
         self._modules        = [PRELUDE]
         self._module_queue   = []
         self._tokens         = iter(())
         self._current_token  = None
         self._current_module = PRELUDE
 
-    def _get_array_type(self, items: TypeDef, count: Optional[int], location: Atom) -> ArrayTypeDef:
+    def _get_array_type(self, items: TypeDef, count: Optional[int], location: Span) -> ArrayTypeDef:
         name, _ = _array_type_info(items, count)
         key = (location.fileid, name)
         if key in self._array_types:
@@ -669,23 +759,23 @@ class Parser:
 
         # check if all dependencies have finished
         for imp in module.imports:
-            imp_module = self._modules[imp.fielid]
+            imp_module = self._modules[imp.fileid]
             if imp_module.state is ModuleState.LOADING:
                 return False
 
         # resolve imports
         for imp in module.imports:
-            imp_module = self._modules[imp.fielid]
+            imp_module = self._modules[imp.fileid]
             if imp.import_map is not None:
-                for mapped_name, (name_tok, mapped_name_tok) in imp.import_map.items():
+                for mapped_name, sym in imp.import_map.items():
                     if mapped_name in module.declared_types:
                         typedef = module.declared_types[mapped_name]
-                        raise TypeNameConflictError(mapped_name, typedef.location, mapped_name_tok)
+                        raise TypeNameConflictError(mapped_name, typedef.location, sym.mapped_name.location)
 
-                    if name_tok.value not in imp_module.declared_types:
-                        raise IllegalImportError(name_tok.value, imp.fileid, name_tok)
+                    if sym.name.name not in imp_module.declared_types:
+                        raise IllegalImportError(sym.name.name, imp.fileid, sym.name.location)
 
-                    module.types[mapped_name] = imp_module.declared_types[name_tok.value]
+                    module.types[mapped_name] = imp_module.declared_types[sym.name.name]
             else:
                 for name, imp_typedef in imp_module.declared_types.items():
                     if name in module.declared_types:
@@ -699,17 +789,27 @@ class Parser:
         module.state = ModuleState.FINISHED
         return True
 
+    def _cursor(self) -> Cursor:
+        return Cursor(self._current_module.fileid, len(self._current_module.tokens))
+
+    def _span(self, cursor: Cursor) -> Span:
+        return make_span(cursor, self._cursor())
+
     def _next_token(self) -> Atom:
         token = self._current_token
         if token is None:
             try:
                 token = next(self._tokens)
             except StopIteration:
-                raise UnexpectedEndOfFileError(self._make_eof_token())
+                eof_cur = self._cursor()
+                self._current_module.tokens.append(self._make_eof_token())
+                raise UnexpectedEndOfFileError(self._span(eof_cur))
             else:
+                self._current_module.tokens.append(token)
                 return token
 
         self._current_token = None
+        self._current_module.tokens.append(token)
         return token
 
     def _peek_token(self) -> Optional[Atom]:
@@ -725,7 +825,7 @@ class Parser:
 
         return token
 
-    def _has_next(self, tok: Optional[Atom]=None, val: Optional[str]=None) -> bool:
+    def _has_next(self, tok: Optional[TOK] = None, val: Optional[str] = None) -> bool:
         token = self._next_token()
 
         if tok is not None and token.token != tok:
@@ -743,7 +843,7 @@ class Parser:
         column = len(source) - source.rindex("\n")
         return Atom(module.fileid, lineno, column, lineno, column, TOK.EOF, '')
 
-    def _expect(self, tok: Optional[Atom]=None, val: Optional[str]=None) -> Atom:
+    def _expect(self, tok: Optional[TOK] = None, val: Optional[str] = None) -> Atom:
         token = self._next_token()
 
         if tok is not None and token.token != tok:
@@ -780,8 +880,7 @@ class Parser:
                 self._next_token()
 
                 if self._has_next(TOK.ID):
-                    body_tok = self._next_token()
-                    value = Identifier(body_tok.value, body_tok)
+                    value = self._parse_id()
                 elif self._has_next(TOK.TYPE):
                     value = self._parse_type_ref()
                 else:
@@ -794,17 +893,20 @@ class Parser:
 
     @contextmanager
     def _expect_paren(self, paren: TOK):
+        open_at  = self._cursor()
         open_tok = self._expect(paren)
         yield open_tok
-        self._expect_close(open_tok)
+        self._expect_close(open_at)
 
-    def _expect_close(self, open_tok: Atom) -> Atom:
+    def _expect_close(self, open_at: Cursor) -> Atom:
+        open_tok  = self._current_module.tokens[open_at.index]
+        close_at  = self._cursor()
         close_tok = self._next_token()
-        if close_tok.tok != open_tok.token:
-            raise UnbalancedParanthesesError(open_tok, close_tok)
+        if close_tok.token != CLOSE_PARENS[open_tok.token]:
+            raise UnbalancedParanthesesError(open_tok.token, close_tok.token, open_at.to_span(), close_at.to_span())
         return close_tok
 
-    def _queue_module(self, filename: str, source: Optional[str]=None) -> int:
+    def _queue_module(self, filename: str, source: Optional[str] = None) -> int:
         if self._current_module is not PRELUDE and (filename.startswith('./') or filename.startswith('../')):
             filename = join_path(dirname(self._current_module.filename), filename)
         else:
@@ -842,27 +944,27 @@ class Parser:
             self._current_module.imports.append(Import(atom, fileid))
         else:
             # import only explicitely listed types
-            import_map:Dict[str, Tuple[TOK, TOK]] = OrderedDict()
+            import_map: Dict[str, ImportSymbol] = OrderedDict()
             with self._expect_paren(TOK.CUR_OPEN):
                 while not self._has_next(TOK.CUR_CLOSE):
-                    name_tok = self._expect(TOK.ID)
+                    name_id = self._parse_id()
 
                     if self._has_next(TOK.AS):
                         self._next_token()
-                        mapped_name_tok = self._expect(TOK.ID)
-                        name = mapped_name_tok.value
+                        mapped_id = self._parse_id()
+                        name = mapped_id.name
 
                         if name in import_map:
-                            raise TypeNameConflictError(name, mapped_name_tok, import_map[name].location)
+                            raise TypeNameConflictError(name, mapped_id.location, import_map[name].mapped_name.location)
 
-                        import_map[name] = (name_tok, mapped_name_tok)
+                        import_map[name] = ImportSymbol(name_id, mapped_id)
                     else:
-                        name = name_tok.value
+                        name = name_id.name
 
                         if name in import_map:
-                            raise TypeNameConflictError(name, name_tok, import_map[name].location)
+                            raise TypeNameConflictError(name, name_id.location, import_map[name].mapped_name.location)
 
-                        import_map[name_tok.value] = (name_tok, name_tok)
+                        import_map[name] = ImportSymbol(name_id)
 
                     if self._has_next(TOK.SEMICOL):
                         self._next_token()
@@ -878,18 +980,24 @@ class Parser:
 
         self._expect(TOK.SEMICOL)
 
+    def _parse_id(self):
+        cur  = self._cursor()
+        atom = self._expect(TOK.ID)
+        return Identifier(atom.value, self._span(cur))
+
     def _parse_struct_def(self):
+        cur = self._cursor()
         attrs = Attributes(parent=self._current_module.attributes)
         while self._has_next(TOK.HASH):
             attr = self._parse_attribute()
             attrs.declare(attr)
 
         self._expect(TOK.STRUCT)
-        name_tok = self._expect(TOK.ID)
+        name_id = self._parse_id()
 
-        name = name_tok.value
+        name = name_id.name
         if name in self._current_module.declared_types:
-            raise TypeNameConflictError(name, name_tok, self._current_module.types[name].location)
+            raise TypeNameConflictError(name, name_id.location, self._current_module.types[name].location)
 
         fields   = OrderedDict()
         stack    = []
@@ -906,7 +1014,7 @@ class Parser:
                 else:
                     field = self._parse_field_def()
                     if section is None:
-                        section = UnconditionalSection(field.location, len(fields), 0)
+                        section = UnconditionalSection(len(fields), 0, field.location)
                         sections.append(section)
 
                     if field.name in fields:
@@ -916,11 +1024,12 @@ class Parser:
                     section.field_count += 1
 
         # TODO: resolve size after typecheck phase
-        struct_def = StructDef(name, name_tok, fields, None, sections)
+        struct_def = StructDef(name, self._span(cur), fields, None, sections)
         self._current_module.declare(name, struct_def)
 
     def _parse_conditional_section(self, fields: Dict[str, FieldDef], stack: List[Expr]):
-        location = self._expect(TOK.IF)
+        cur = self._cursor()
+        self._expect(TOK.IF)
         sections = []
         section  = None
 
@@ -938,7 +1047,7 @@ class Parser:
                 else:
                     field = self._parse_field_def()
                     if section is None:
-                        section = UnconditionalSection(field.location, len(fields), 0)
+                        section = UnconditionalSection(len(fields), 0, field.location)
                         sections.append(section)
 
                     if field.name in fields:
@@ -948,7 +1057,7 @@ class Parser:
                     section.field_count += 1
         stack.pop()
 
-        return ConditionalSection(location, condition, sections)
+        return ConditionalSection(condition, sections, self._span(cur))
 
     def _parse_field_def(self):
         attrs = Attributes()
@@ -971,7 +1080,7 @@ class Parser:
 
         self._expect(TOK.SEMICOL)
 
-        return FieldDef(name_tok, name_tok.name, type_ref, value, optional, attrs)
+        return FieldDef(name_tok.name, type_ref, value, optional, attrs, name_tok)
 
     def _parse_type_ref(self):
         name_tok = self._expect(TOK.ID)
@@ -987,22 +1096,74 @@ class Parser:
 
         return type_ref
 
+    def _parse_int(self):
+        cur   = self._cursor()
+        token = self._expect(TOK.INT)
+        match = R_INT.match(token.value)
+        signed_char = match.group(5)
+        str_bits    = match.group(6)
+        signed      = signed_char == 'i'
+        bits        = int(str_bits) if str_bits is not None else None
+
+        str_val = match.group(0)
+        if str_val is not None:
+            value = int(str_val, 10)
+
+        else:
+            str_val = match.group(1)
+            if str_val is not None:
+                value = int(str_val, 16)
+            else:
+                str_val = match.group(2)
+                if str_val is not None:
+                    value = int(str_val, 8)
+                else:
+                    value = int(str_val, 2)
+
+        if value < 0 and not signed:
+            raise TypeError("unsigned integer cannot be negative")
+
+        if bits is None:
+            typedef = None
+        elif signed:
+            typedef = SIGNED_INTS[bits]
+        else:
+            typedef = UNSIGNED_INTS[bits]
+
+        return Integer(value, typedef, cur.to_span())
+
+    def _parse_str(self):
+        cur   = self._cursor()
+        token = self._expect(TOK.STR)
+
+        match = R_STR.match(token.value)
+        if match.group(1):
+            raise TypeError(f"illegal string prefix: {token.value}")
+        value = R_STR_ELEM.sub(_replace_str_elem, match.group(2))
+        return String(value, cur.to_span())
+
+    def _parse_byte(self):
+        cur   = self._cursor()
+        token = self._expect(TOK.BYTE)
+
+        val = self.value[1:-1]
+        if val.startswith('\\x'):
+            value = int(val[2:], 16)
+
+        elif val.startswith('\\'):
+            value = ESC_BYTE_MAP[val]
+
+        else:
+            value = ord(val)
+
+        return Integer(value, BYTE, cur.to_span())
+
     def _parse_value(self):
         if self._has_next(TOK.INT):
-            token = self._next_token()
-            value, signed, bits = token.parse_value()
-            if bits is None:
-                typedef = None
-            elif signed:
-                typedef = SIGNED_INTS[bits]
-            else:
-                typedef = UNSIGNED_INTS[bits]
-
-            return Integer(value, typedef, token)
+            return self._parse_int()
 
         elif self._has_next(TOK.BYTE):
-            token = self._next_token()
-            return Integer(token.parse_value(), BYTE, token)
+            return self._parse_byte()
 
         elif self._has_next(TOK.FLOAT):
             token = self._next_token()
@@ -1019,8 +1180,7 @@ class Parser:
             return Bool(token.parse_value(), token)
 
         elif self._has_next(TOK.STR):
-            token = self._next_token()
-            return String(token.parse_value(), token)
+            self._parse_str()
 
         elif self._has_next(TOK.BYTES):
             token = self._next_token()
@@ -1051,10 +1211,9 @@ class Parser:
                 items: Dict[str, Tuple[Identifier, Value]] = OrderedDict()
                 # parse struct literal
                 while not self._has_next(TOK.CUR_CLOSE):
-                    ident_tok = self._expect(TOK.ID)
-                    key = Identifier(ident_tok.value, ident_tok)
+                    key = self._parse_id()
                     if key.name in items:
-                        raise FieldRedefinedError(key, ident_tok, items[key][0])
+                        raise FieldRedefinedError(key, key.location, items[key][0].location)
 
                     self._expect(TOK.COLON)
                     value = self._parse_value()
@@ -1180,31 +1339,29 @@ class Parser:
     def _parse_postfix_expr(self):
         expr = self._parse_primary_expr()
         while self._has_next(TOK.DOT) or self._has_next(TOK.BR_OPEN):
-            token = self._next_token()
-            if token.token == TOK.DOT:
-                ident_tok = self._expect(TOK.ID)
-                expr = FieldAccessExpr(expr, Identifier(ident_tok.value, ident_tok), expr.location)
+            if self._has_next(TOK.DOT):
+                self._next_token()
+                ident = self._parse_id()
+                expr  = FieldAccessExpr(expr, ident, expr.location)
             else:
-                item = self._parse_expr()
-                self._expect_close(token)
+                with self._expect_paren(TOK.BR_OPEN):
+                    item = self._parse_expr()
                 expr = ArrayItemAccessExpr(expr, item, expr.location)
         return expr
 
     def _parse_primary_expr(self):
         if self._has_next(TOK.ID):
-            token = self._next_token()
-            return Identifier(token.value, token)
+            return self._parse_id()
 
         if self._has_next(TOK.PAR_OPEN):
-            token = self._next_token()
-            expr = self._parse_expr()
-            self._expect_close(token)
+            with self._expect_paren(TOK.PAR_OPEN):
+                expr = self._parse_expr()
             return expr
 
         return self._parse_value()
 
-def parse_file(filename: str, root_path:str='.'):
+def parse_file(filename: str, root_path: str = '.'):
     return Parser(root_path).parse_file(abspath(filename))
 
-def parse_string(source: str, filename: str='-', root_path:str='.'):
+def parse_string(source: str, filename: str = '-', root_path: str = '.'):
     return Parser(root_path).parse_string(source, filename)

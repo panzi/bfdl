@@ -74,12 +74,12 @@ if __name__ == '__main__':
 
 TOKENS = list(REG_EXPS.keys())
 
-TOKENIZER = re.compile('^' +
-    r'|'.join(r'(?P<%s>%s)' % (tok.name, regex) for tok, regex in REG_EXPS.items()),
+TOKENIZER = re.compile(
+    '^' + r'|'.join(r'(?P<%s>%s)' % (tok.name, regex) for tok, regex in REG_EXPS.items()),
     re.M | re.U
 )
 
-def tokenize(source: str, fileid:int=-1):
+def tokenize(source: str, fileid: int = -1):
     index  = 0
     lineno = 1
     column = 1
@@ -109,7 +109,7 @@ def tokenize(source: str, fileid:int=-1):
         end_lineno = lineno
         end_column = column
 
-        if not token in IGNORABLE:
+        if token not in IGNORABLE:
             yield Atom(fileid, start_lineno, start_column,
                        end_lineno, end_column, token, value)
 
