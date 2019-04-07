@@ -15,7 +15,7 @@ from .errors import (
     UnexpectedEndOfFileError, ParserError, IllegalTokenError, AttributeRedeclaredError,
     UnbalancedParanthesesError, TypeNameConflictError, IllegalImportError, FieldRedeclaredError,
     FieldRedefinedError, TypeUnificationError, UndeclaredTypeError, IllegalReferenceError,
-    FieldAccessError, ItemAccessError, BFDLTypeError,
+    FieldAccessError, ItemAccessError, AssignmentError, IntegerSignError, BFDLTypeError,
 )
 
 HEX = r'\\x[0-9a-fA-F]{2}'
@@ -119,7 +119,7 @@ class FieldDef(ASTNode):
 
     @property
     def fixed(self) -> bool:
-        return self.attributes.get('fixed', False)
+        return bool(self.attributes.get('fixed', False))
 
 class Section(ASTNode):
     pass
@@ -144,13 +144,13 @@ def unify_types(lhs: TypeDef, rhs: TypeDef) -> Optional[TypeDef]:
     if rhs is NEVER:
         return lhs
 
-    if isinstance(lhs, NullableType) and isinstance(rhs, NullableType):
-        typedef = unify_types(lhs.typedef, rhs.typedef)
-        return NullableType(typedef) if typedef is not None else None
-
     if isinstance(lhs, NullableType):
-        typedef = unify_types(lhs.typedef, rhs)
-        return NullableType(typedef) if typedef is not None else None
+        if isinstance(rhs, NullableType):
+            typedef = unify_types(lhs.typedef, rhs.typedef)
+            return NullableType(typedef) if typedef is not None else None
+        else:
+            typedef = unify_types(lhs.typedef, rhs)
+            return NullableType(typedef) if typedef is not None else None
 
     if isinstance(rhs, NullableType):
         typedef = unify_types(lhs, rhs.typedef)
@@ -159,7 +159,10 @@ def unify_types(lhs: TypeDef, rhs: TypeDef) -> Optional[TypeDef]:
     if not isinstance(lhs, PrimitiveType) or not isinstance(rhs, PrimitiveType):
         return None
 
-    if lhs.pytype is int and rhs.pytype is int:
+    if isinstance(lhs, IntegerType) and isinstance(rhs, IntegerType):
+        if lhs.signed != rhs.signed:
+            return None
+
         if lhs.size > rhs.size:
             return lhs
         elif rhs.size > lhs.size:
@@ -181,7 +184,41 @@ def unify_types(lhs: TypeDef, rhs: TypeDef) -> Optional[TypeDef]:
     return None
 
 def is_assignable(source: TypeDef, target: TypeDef) -> bool:
-    raise NotImplementedError # TODO
+    if target is source:
+        return True
+
+    if target is NEVER:
+        return False
+
+    if source is NEVER:
+        return True
+
+    if isinstance(source, NullableType):
+        if isinstance(target, NullableType):
+            return is_assignable(source.typedef, target.typedef)
+        else:
+            return False
+
+    if isinstance(target, NullableType):
+        return is_assignable(source, target.typedef)
+
+    # TODO: static arrays values should be assignable to dynamic array fields
+
+    if not isinstance(target, PrimitiveType) or not isinstance(source, PrimitiveType):
+        return False
+
+    if isinstance(source, IntegerType) and isinstance(target, IntegerType):
+        if source.signed and not target.signed:
+            return False
+        return source.size <= target.size
+
+    if isinstance(source, IntegerType) and isinstance(target, FloatType):
+        return True
+
+    if isinstance(source, FloatType) and isinstance(target, FloatType):
+        return True
+
+    return False
 
 class Expr(ASTNode):
     def get_type_def(self, parser: "Parser", module: "Module", context: Optional[StructDef]) -> TypeDef:
@@ -190,7 +227,7 @@ class Expr(ASTNode):
     def type_check(self, target: TypeDef, parser: "Parser", module: "Module", context: Optional[StructDef]) -> None:
         typedef = self.get_type_def(parser, module, context)
         if not is_assignable(typedef, target):
-            raise BFDLTypeError(typedef.name, target.name, self.location)
+            raise AssignmentError(typedef.name, target.name, self.location)
 
     def fold(self) -> "Expr":
         return self
@@ -215,6 +252,27 @@ class ConditionalExpr(Expr):
                                        true_type.name, false_type.name)
         return typedef
 
+    def type_check(self, target: TypeDef, parser: "Parser", module: "Module", context: Optional[StructDef]) -> None:
+        self.condition.type_check(BOOL, parser, module, context)
+
+        typedef = self.get_type_def(parser, module, context)
+        if not is_assignable(typedef, target):
+            raise AssignmentError(typedef.name, target.name, self.location)
+
+    def fold(self) -> Expr:
+        condition = self.condition.fold()
+
+        if isinstance(condition, Value):
+            if condition.value:
+                return self.true_expr.fold()
+            else:
+                return self.false_expr.fold()
+
+        true_expr  = self.true_expr.fold()
+        false_expr = self.false_expr.fold()
+
+        return ConditionalExpr(condition, true_expr, false_expr, self.location)
+
 COMPARE_OPS = frozenset((
     TOK.EQ, TOK.NE, TOK.LT, TOK.GT, TOK.LE, TOK.GE,
 ))
@@ -232,6 +290,8 @@ BOOL_OPS = frozenset((
 ))
 
 BOOL_RES_OPS = COMPARE_OPS | BOOL_OPS
+
+# TODO: more constant folding and type checking
 
 class BinaryExpr(Expr):
     lhs: Expr
@@ -286,7 +346,8 @@ class Identifier(Expr):
         field = context.fields[self.name]
         typedef = field.type_ref.resolve(parser, module)
         if not isinstance(typedef, NullableType) and (
-                (field.optional and field.default is None) or isinstance(field.default, Null)):
+                (field.optional and field.default is None) or
+                (field.default is not None and isinstance(field.default.get_type_def(parser, module, context), NullableType))):
             typedef = NullableType(typedef, field.type_ref.location)
         return typedef
 
@@ -381,18 +442,28 @@ class PrimitiveType(TypeDef):
         super().__init__(name, size, location or Span(0, 0, 0))
         self.pytype = pytype
 
-UINT8  = PrimitiveType(int,   1, "uint8")
-INT8   = PrimitiveType(int,   1, "int8")
-BYTE   = PrimitiveType(int,   1, "byte")
-UINT16 = PrimitiveType(int,   2, "uint16")
-INT16  = PrimitiveType(int,   2, "int16")
-UINT32 = PrimitiveType(int,   4, "uint32")
-INT32  = PrimitiveType(int,   4, "int32")
-UINT64 = PrimitiveType(int,   8, "uint64")
-INT64  = PrimitiveType(int,   8, "int64")
+class IntegerType(PrimitiveType):
+    signed: bool
+
+    def __init__(self, pytype: type, size: int, name: str, signed: bool=False, location: Optional[Span] = None):
+        super().__init__(pytype, size, name, location)
+        self.signed = signed
+
+class FloatType(PrimitiveType):
+    pass
+
+UINT8  = IntegerType(int,   1, "uint8",  False)
+INT8   = IntegerType(int,   1, "int8",   True)
+BYTE   = IntegerType(int,   1, "byte",   False)
+UINT16 = IntegerType(int,   2, "uint16", False)
+INT16  = IntegerType(int,   2, "int16",  True)
+UINT32 = IntegerType(int,   4, "uint32", False)
+INT32  = IntegerType(int,   4, "int32",  True)
+UINT64 = IntegerType(int,   8, "uint64", False)
+INT64  = IntegerType(int,   8, "int64",  True)
 BOOL   = PrimitiveType(bool,  1, "bool")
-FLOAT  = PrimitiveType(float, 4, "float")
-DOUBLE = PrimitiveType(float, 8, "double")
+FLOAT  = FloatType(float, 4, "float")
+DOUBLE = FloatType(float, 8, "double")
 
 PRIMITIVES = dict((tp.name, tp) for tp in [
     UINT8, INT8, BYTE, UINT16, INT16, UINT32, INT32,
@@ -462,7 +533,7 @@ class PrimitiveValue(AtomicValue):
                 if value <= 0xFFFFFFFFFFFFFFFF and value >= 0:
                     return UINT64
 
-                raise ValueError(f"integer out of bounds: {value}") # TODO: propper error class
+                raise BFDLTypeError(self.location, f"integer out of bounds: {value}")
 
             if isinstance(value, float):
                 return DOUBLE
@@ -1125,8 +1196,9 @@ class Parser:
                 else:
                     value = int(str_val, 2)
 
+        location = cur.to_span()
         if value < 0 and not signed:
-            raise TypeError("unsigned integer cannot be negative")
+            raise IntegerSignError(value, location)
 
         if bits is None:
             typedef = None
@@ -1135,7 +1207,7 @@ class Parser:
         else:
             typedef = UNSIGNED_INTS[bits]
 
-        return Integer(value, typedef, cur.to_span())
+        return Integer(value, typedef, location)
 
     def _parse_str(self) -> String:
         cur   = self._cursor()
@@ -1143,10 +1215,11 @@ class Parser:
 
         match = R_STR.match(token.value)
         assert match
+        location = cur.to_span()
         if match.group(1):
-            raise TypeError(f"illegal string prefix: {token.value}")
+            raise BFDLTypeError(location, f"illegal string prefix: {token.value}")
         value = R_STR_ELEM.sub(_replace_str_elem, match.group(2))
-        return String(value, cur.to_span())
+        return String(value, location)
 
     def _parse_byte(self) -> Integer:
         cur   = self._cursor()
@@ -1384,7 +1457,7 @@ class Parser:
 
         if self._has_next(TOK.RAISE):
             cur = self._cursor()
-            token = self._next_token()
+            self._next_token()
             msg = self._parse_str()
             return RaiseExpr(msg, self._span(cur))
 

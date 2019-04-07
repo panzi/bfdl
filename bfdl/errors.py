@@ -121,10 +121,23 @@ class UnbalancedParanthesesError(ParserError):
 
 class BFDLTypeError(BFDLError):
     location: Span
+
+    def __init__(self, location: Span, message: Optional[str] = None):
+        super().__init__(message)
+        self.location = location
+
+class AssignmentError(BFDLTypeError):
     source: str
     target: str
 
     def __init__(self, source: str, target: str, location: Span, message: Optional[str] = None):
-        super().__init__(message or f"{source} is not assignable to {target}")
-        self.source = source
-        self.target = target
+        super().__init__(location, message or f"{source} is not assignable to {target}")
+        self.source   = source
+        self.target   = target
+
+class IntegerSignError(BFDLTypeError):
+    value: int
+
+    def __init__(self, value: int, location: Span, message: Optional[str] = None):
+        super().__init__(location, message or f"unsigned integer cannot be negative")
+        self.value = value
