@@ -293,8 +293,6 @@ BOOL_OPS = frozenset((
 
 BOOL_RES_OPS = COMPARE_OPS | BOOL_OPS
 
-# TODO: more constant folding and type checking
-
 class BinaryExpr(Expr):
     lhs: Expr
     rhs: Expr
@@ -338,7 +336,7 @@ class BinaryExpr(Expr):
             if not isinstance(rhs_type, NumberType):
                 raise BFDLTypeError(self.rhs.location, f"{rhs_type.name} is not a number type")
 
-        if operator in BIT_OPS:
+        elif operator in BIT_OPS:
             if not isinstance(lhs_type, IntegerType):
                 raise BFDLTypeError(self.lhs.location, f"{lhs_type.name} is not an integer type")
 
@@ -353,7 +351,7 @@ class BinaryExpr(Expr):
         rhs = self.rhs.fold()
         operator = self.op
 
-        if isinstance(lhs, Value) and isinstance(rhs, Value):
+        if isinstance(lhs, Number) and isinstance(rhs, Number):
             if operator == TOK.ADD:
                 return lhs + rhs
 
@@ -369,27 +367,6 @@ class BinaryExpr(Expr):
             if operator == TOK.MOD:
                 return lhs % rhs
 
-            if operator == TOK.OR:
-                return lhs.or_(rhs)
-
-            if operator == TOK.AND:
-                return lhs.and_(rhs)
-
-            if operator == TOK.BAND:
-                return lhs & rhs
-
-            if operator == TOK.BOR:
-                return lhs | rhs
-
-            if operator == TOK.XOR:
-                return lhs ^ rhs
-
-            if operator == TOK.EQ:
-                return lhs.eq(rhs)
-
-            if operator == TOK.NE:
-                return lhs.ne(rhs)
-
             if operator == TOK.LT:
                 return lhs.lt(rhs)
 
@@ -402,16 +379,42 @@ class BinaryExpr(Expr):
             if operator == TOK.GE:
                 return lhs.ge(rhs)
 
+        if isinstance(lhs, Bool) and isinstance(rhs, Bool):
+            if operator == TOK.OR:
+                return lhs.or_(rhs)
+
+            if operator == TOK.AND:
+                return lhs.and_(rhs)
+
+        if isinstance(lhs, Integer) and isinstance(rhs, Integer):
+            if operator == TOK.BAND:
+                return lhs & rhs
+
+            if operator == TOK.BOR:
+                return lhs | rhs
+
+            if operator == TOK.XOR:
+                return lhs ^ rhs
+
             if operator == TOK.LSHIFT:
                 return lhs << rhs
 
             if operator == TOK.RSHIFT:
                 return lhs >> rhs
 
-        if lhs is not self.lhs and rhs is not self.rhs:
+        if isinstance(lhs, Value) and isinstance(rhs, Value):
+            if operator == TOK.EQ:
+                return lhs.eq(rhs)
+
+            if operator == TOK.NE:
+                return lhs.ne(rhs)
+
+        if lhs is not self.lhs or rhs is not self.rhs:
             return BinaryExpr(lhs, rhs, operator, self.location)
 
         return self
+
+# TODO: more constant folding and type checking
 
 class UnaryExpr(Expr):
     op:   TOK
@@ -424,6 +427,48 @@ class UnaryExpr(Expr):
 
     def get_type_def(self, parser: "Parser", module: "Module", context: Optional[StructDef]) -> TypeDef:
         return self.expr.get_type_def(parser, module, context)
+
+    def type_check(self, target: TypeDef, parser: "Parser", module: "Module", context: Optional[StructDef]) -> None:
+        self.expr.type_check(target, parser, module, context)
+
+        typedef = self.expr.get_type_def(parser, module, context)
+
+        operator = self.op
+        if operator == TOK.SUB:
+            if isinstance(typedef, IntegerType) and not typedef.signed:
+                raise BFDLTypeError(self.expr.location, f"{typedef.name} is an unsinged integer")
+
+            if not isinstance(typedef, NumberType):
+                raise BFDLTypeError(self.expr.location, f"{typedef.name} is not a number type")
+
+        elif operator == TOK.BNOT:
+            if not isinstance(typedef, IntegerType):
+                raise BFDLTypeError(self.expr.location, f"{typedef.name} is not an integer type")
+
+        elif operator == TOK.BANG:
+            if typedef is not BOOL:
+                raise BFDLTypeError(self.expr.location, f"{typedef.name} is not an bool")
+
+        if not is_assignable(typedef, target):
+            raise AssignmentError(typedef.name, target.name, self.location)
+
+    def fold(self) -> Expr:
+        expr = self.expr.fold()
+
+        operator = self.op
+        if isinstance(expr, Number) and operator == TOK.SUB:
+            return expr.negate()
+
+        if isinstance(expr, Integer) and operator == TOK.BNOT:
+            return expr.bnot()
+
+        if isinstance(expr, Bool) and operator == TOK.BANG:
+            return expr.not_()
+
+        if expr is self.expr:
+            return self
+
+        return UnaryExpr(operator, expr, self.location)
 
 class PostfixExpr(Expr):
     def get_type_def(self, parser: "Parser", module: "Module", context: Optional[StructDef]) -> TypeDef:
@@ -444,7 +489,9 @@ class Identifier(Expr):
         typedef = field.type_ref.resolve(parser, module)
         if not isinstance(typedef, NullableType) and (
                 (field.optional and field.default is None) or
-                (field.default is not None and isinstance(field.default.get_type_def(parser, module, context), NullableType))):
+                (field.default is not None and isinstance(
+                    field.default.get_type_def(parser, module, context),
+                    NullableType))):
             typedef = NullableType(typedef, field.type_ref.location)
         return typedef
 
@@ -561,7 +608,7 @@ UINT32 = IntegerType(int,   4, "uint32", False)
 INT32  = IntegerType(int,   4, "int32",  True)
 UINT64 = IntegerType(int,   8, "uint64", False)
 INT64  = IntegerType(int,   8, "int64",  True)
-BOOL   = PrimitiveType(bool,  1, "bool")
+BOOL   = PrimitiveType(bool, 1, "bool")
 FLOAT  = FloatType(float, 4, "float")
 DOUBLE = FloatType(float, 8, "double")
 
@@ -611,53 +658,11 @@ class Value(Expr):
     def get_type_def(self, parser: "Parser", module: "Module", context: Optional[StructDef]) -> TypeDef:
         raise NotImplementedError
 
-    def __add__(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def __sub__(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def __mul__(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def __truediv__(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def __mod__(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def __and__(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def __or__(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def __xor__(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def __lshift__(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def __rshift__(self, other: Value) -> Value:
-        raise NotImplementedError
-
     def eq(self, other: Value) -> Value:
-        raise NotImplementedError
+        return Bool(self.value == other.value, self.location)
 
     def ne(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def lt(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def gt(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def le(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def ge(self, other: Value) -> Value:
-        raise NotImplementedError
+        return Bool(self.value != other.value, self.location)
 
     def and_(self, other: Value) -> Value:
         raise NotImplementedError
@@ -706,12 +711,6 @@ class PrimitiveValue(AtomicValue):
 
         return self.typedef
 
-    def eq(self, other: Value) -> Value:
-        return Bool(self.value == other.value, self.location)
-
-    def ne(self, other: Value) -> Value:
-        return Bool(self.value != other.value, self.location)
-
     def lt(self, other: Value) -> Value:
         return Bool(self.value < other.value, self.location)
 
@@ -724,14 +723,36 @@ class PrimitiveValue(AtomicValue):
     def ge(self, other: Value) -> Value:
         return Bool(self.value >= other.value, self.location)
 
-    def and_(self, other: Value) -> Value:
-        return Bool(bool(self.value and other.value), self.location)
-
-    def or_(self, other: Value) -> Value:
-        return Bool(bool(self.value or other.value), self.location)
-
 class Number(PrimitiveValue):
-    pass
+    def __add__(self, other: Value) -> Value:
+        raise NotImplementedError
+
+    def __sub__(self, other: Value) -> Value:
+        raise NotImplementedError
+
+    def __mul__(self, other: Value) -> Value:
+        raise NotImplementedError
+
+    def __truediv__(self, other: Value) -> Value:
+        raise NotImplementedError
+
+    def __mod__(self, other: Value) -> Value:
+        raise NotImplementedError
+
+    def negate(self) -> Expr:
+        raise NotImplementedError
+
+    def lt(self, other: Value) -> Value:
+        raise NotImplementedError
+
+    def gt(self, other: Value) -> Value:
+        raise NotImplementedError
+
+    def le(self, other: Value) -> Value:
+        raise NotImplementedError
+
+    def ge(self, other: Value) -> Value:
+        raise NotImplementedError
 
 class Integer(Number):
     value: int
@@ -740,6 +761,29 @@ class Integer(Number):
         super().__init__(typedef, location)
         self.value = value
 
+    def __and__(self, other: Value) -> Value:
+        raise NotImplementedError
+
+    def __or__(self, other: Value) -> Value:
+        raise NotImplementedError
+
+    def __xor__(self, other: Value) -> Value:
+        raise NotImplementedError
+
+    def __lshift__(self, other: Value) -> Value:
+        raise NotImplementedError
+
+    def __rshift__(self, other: Value) -> Value:
+        raise NotImplementedError
+
+    def bnot(self) -> Expr:
+        # TODO: signed?
+        return Integer(~self.value, self.typedef, self.location)
+
+    def negate(self) -> Expr:
+        # TODO: convert unsigned to singed type?
+        return Integer(-self.value, self.typedef, self.location)
+
 class Float(Number):
     value: float
 
@@ -747,12 +791,24 @@ class Float(Number):
         super().__init__(typedef, location)
         self.value = value
 
+    def negate(self) -> Expr:
+        return Float(-self.value, self.typedef, self.location)
+
 class Bool(PrimitiveValue):
     value: bool
 
     def __init__(self, value: bool, location: Span):
         super().__init__(BOOL, location)
         self.value = value
+
+    def not_(self) -> Expr:
+        return Bool(not self.value, self.location)
+
+    def and_(self, other: Value) -> Value:
+        return Bool(bool(self.value and other.value), self.location)
+
+    def or_(self, other: Value) -> Value:
+        return Bool(bool(self.value or other.value), self.location)
 
 class String(AtomicValue):
     value: str
