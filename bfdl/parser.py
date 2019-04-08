@@ -664,12 +664,6 @@ class Value(Expr):
     def ne(self, other: Value) -> Value:
         return Bool(self.value != other.value, self.location)
 
-    def and_(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def or_(self, other: Value) -> Value:
-        raise NotImplementedError
-
 class AtomicValue(Value):
     def get_type_def(self, parser: "Parser", module: "Module", context: Optional[StructDef]) -> TypeDef:
         raise NotImplementedError
