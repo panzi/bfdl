@@ -96,6 +96,9 @@ class TypeRef(ASTNode):
         super().__init__(location)
         self.name = name
 
+    def fold(self) -> "TypeRef":
+        return self
+
     def resolve(self, parser: "Parser", module: "Module") -> TypeDef:
         if self.name not in module.types:
             raise UndeclaredTypeError(self.name, self.location)
@@ -128,6 +131,9 @@ class FieldDef(ASTNode):
     def fixed(self) -> bool:
         return bool(self.attributes.get('fixed', False))
 
+    def fold(self) -> None:
+        self.type_ref = self.type_ref.fold()
+
     def is_inlined(self, parser: "Parser", module: "Module", context: "StructDef") -> bool:
         typedef = self.type_ref.resolve(parser, module)
         return (
@@ -149,6 +155,10 @@ class StructDef(TypeDef):
         super().__init__(name, size, location)
         self.fields   = fields if fields is not None else OrderedDict()
         self.sections = sections if sections is not None else []
+
+    def fold(self) -> None:
+        for field in self.fields.values():
+            field.fold()
 
     def type_check(self, parser: "Parser", module: "Module") -> None:
         context = TypeCheckContext(parser, module, self)
@@ -638,6 +648,15 @@ class ArrayTypeRef(TypeRef):
         self.item_ref = item_ref
         self.count    = count
 
+    def fold(self) -> "ArrayTypeRef":
+        count = self.count.fold() if self.count is not None else None
+        item_ref = self.item_ref.fold()
+
+        if count is not self.count or item_ref is not self.item_ref:
+            return ArrayTypeRef(item_ref, count, self.location)
+
+        return self
+
     def resolve(self, parser: "Parser", module: "Module") -> TypeDef:
         items = self.item_ref.resolve(parser, module)
         if self.count is None or not isinstance(self.count, Integer):
@@ -652,7 +671,7 @@ class ArrayTypeRef(TypeRef):
 
         self.item_ref.type_check(context)
         if self.count:
-            self.count.type_check(UINT64, context)
+            self.count.type_check(SIZE, context)
 
 class PrimitiveType(TypeDef):
     pytype: type
@@ -675,31 +694,35 @@ class IntegerType(NumberType):
 class FloatType(NumberType):
     pass
 
-UINT8  = IntegerType(int,   1, "uint8",  False)
-INT8   = IntegerType(int,   1, "int8",   True)
-BYTE   = IntegerType(int,   1, "byte",   False)
-UINT16 = IntegerType(int,   2, "uint16", False)
-INT16  = IntegerType(int,   2, "int16",  True)
-UINT32 = IntegerType(int,   4, "uint32", False)
-INT32  = IntegerType(int,   4, "int32",  True)
-UINT64 = IntegerType(int,   8, "uint64", False)
-INT64  = IntegerType(int,   8, "int64",  True)
-BOOL   = PrimitiveType(bool, 1, "bool")
-FLOAT  = FloatType(float, 4, "float")
-DOUBLE = FloatType(float, 8, "double")
+UINT8   = IntegerType(int,   1, "uint8",   False)
+INT8    = IntegerType(int,   1, "int8",    True)
+BYTE    = IntegerType(int,   1, "byte",    False)
+UINT16  = IntegerType(int,   2, "uint16",  False)
+INT16   = IntegerType(int,   2, "int16",   True)
+UINT32  = IntegerType(int,   4, "uint32",  False)
+INT32   = IntegerType(int,   4, "int32",   True)
+UINT64  = IntegerType(int,   8, "uint64",  False)
+INT64   = IntegerType(int,   8, "int64",   True)
+UINT128 = IntegerType(int,  16, "uint128", False)
+INT128  = IntegerType(int,  16, "int128",  True)
+BOOL    = PrimitiveType(bool, 1, "bool")
+FLOAT   = FloatType(float, 4, "float")
+DOUBLE  = FloatType(float, 8, "double")
+
+SIZE = UINT64
 
 PRIMITIVE_MAP = dict((tp.name, tp) for tp in [
     UINT8, INT8, BYTE, UINT16, INT16, UINT32, INT32,
-    UINT64, INT64, BOOL, FLOAT, DOUBLE,
+    UINT64, INT64, UINT128, INT128, BOOL, FLOAT, DOUBLE,
 ])
 
-SIGNED_INT_MAP   = {8: INT8,  16: INT16,  32: INT32,  64: INT64}
-UNSIGNED_INT_MAP = {8: UINT8, 16: UINT16, 32: UINT32, 64: UINT64}
+SIGNED_INT_MAP   = {8: INT8,  16: INT16,  32: INT32,  64: INT64,  128: UINT128}
+UNSIGNED_INT_MAP = {8: UINT8, 16: UINT16, 32: UINT32, 64: UINT64, 128: INT128}
 
 FLOAT_MAP = {32: FLOAT, 64: DOUBLE}
 
-UINTS = frozenset((UINT8, BYTE, UINT16, UINT32, UINT64))
-SINTS = frozenset((INT8, INT16, INT32, INT64))
+UINTS = frozenset((UINT8, BYTE, UINT16, UINT32, UINT64, UINT128))
+SINTS = frozenset((INT8, INT16, INT32, INT64, INT128))
 
 INTS = UINTS | SINTS
 
@@ -770,6 +793,12 @@ class PrimitiveValue(AtomicValue):
 
                 if value <= 0xFFFFFFFFFFFFFFFF and value >= 0:
                     return UINT64
+
+                if value <= 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF and value >= -0x80000000000000000000000000000000:
+                    return INT128
+
+                if value <= 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF and value >= 0:
+                    return UINT128
 
                 raise BFDLTypeError(self.location, f"integer out of bounds: {value}")
 
@@ -1138,13 +1167,19 @@ class Parser:
                     finish_queue.append(ref_module)
             index += 1
 
-        # TODO: contstant folding
+        # contstant folding
+        for module in self._modules:
+            for typedef in module.declared_types.values():
+                if isinstance(typedef, StructDef):
+                    typedef.fold()
 
-        # TODO: typecheck phase and calculate struct sizes
+        # typecheck phase
         for module in self._modules:
             for typedef in module.declared_types.values():
                 if isinstance(typedef, StructDef):
                     typedef.type_check(self, module)
+
+        # TODO: calculate struct sizes
 
         return module
 
@@ -1610,9 +1645,8 @@ class Parser:
 
         return ArrayLiteral(
             value,
-            ArrayTypeRef(TypeRef(BYTE.name, cur.to_span()), Integer(len(value), UINT64, cur.to_span()), cur.to_span()),
+            ArrayTypeRef(TypeRef(BYTE.name, cur.to_span()), Integer(len(value), SIZE, cur.to_span()), cur.to_span()),
             self._span(cur))
-
 
     def _parse_value(self) -> Value:
         if self._has_next(TOK.INT):
