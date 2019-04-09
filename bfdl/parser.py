@@ -16,6 +16,7 @@ from .errors import (
     UnbalancedParanthesesError, TypeNameConflictError, IllegalImportError, FieldRedeclaredError,
     FieldRedefinedError, TypeUnificationError, UndeclaredTypeError, IllegalReferenceError,
     FieldAccessError, ItemAccessError, AssignmentError, IntegerSignError, BFDLTypeError,
+    CircularTypeError, UninitializedFieldError,
 )
 
 HEX = r'\\x[0-9a-fA-F]{2}'
@@ -100,6 +101,12 @@ class TypeRef(ASTNode):
             raise UndeclaredTypeError(self.name, self.location)
         return module.types[self.name]
 
+    def type_check(self, context: "TypeCheckContext") -> None:
+        if context.inlined:
+            typedef = self.resolve(context.parser, context.module)
+            if typedef is context.struct:
+                raise CircularTypeError(typedef.name, typedef.location, self.location)
+
 class FieldDef(ASTNode):
     name:       str
     type_ref:   TypeRef
@@ -121,6 +128,15 @@ class FieldDef(ASTNode):
     def fixed(self) -> bool:
         return bool(self.attributes.get('fixed', False))
 
+    def is_inlined(self, parser: "Parser", module: "Module", context: "StructDef") -> bool:
+        typedef = self.type_ref.resolve(parser, module)
+        return (
+            not isinstance(typedef, NullableType) and
+            ((not self.optional or self.default is not None) and
+             (self.default is None or not isinstance(
+                 self.default.get_type_def(parser, module, context),
+                 NullableType))))
+
 class Section(ASTNode):
     pass
 
@@ -133,6 +149,44 @@ class StructDef(TypeDef):
         super().__init__(name, size, location)
         self.fields   = fields if fields is not None else OrderedDict()
         self.sections = sections if sections is not None else []
+
+    def type_check(self, parser: "Parser", module: "Module") -> None:
+        context = TypeCheckContext(parser, module, self)
+        for index, field in enumerate(self.fields.values()):
+            context.field_index = index
+            field.type_ref.type_check(context if field.is_inlined(parser, module, self) else context.not_inlined())
+            typedef = field.type_ref.resolve(parser, module)
+            # TODO
+
+class TypeCheckContext:
+    parser: "Parser"
+    module: "Module"
+    struct: StructDef
+    field_index: int
+    inlined:     bool
+
+    def __init__(self,
+                 parser: "Parser",
+                 module: "Module",
+                 struct: StructDef,
+                 field_index: int = -1,
+                 inlined: bool = True):
+        self.parser = parser
+        self.module = module
+        self.struct = struct
+        self.field_index = field_index
+        self.inlined     = inlined
+
+    def not_inlined(self) -> "TypeCheckContext":
+        if self.inlined:
+            return TypeCheckContext(
+                self.parser,
+                self.module,
+                self.struct,
+                self.field_index,
+                False
+            )
+        return self
 
 def unify_types(lhs: TypeDef, rhs: TypeDef) -> Optional[TypeDef]:
     if lhs is rhs:
@@ -224,8 +278,8 @@ class Expr(ASTNode):
     def get_type_def(self, parser: "Parser", module: "Module", context: Optional[StructDef]) -> TypeDef:
         raise NotImplementedError
 
-    def type_check(self, target: TypeDef, parser: "Parser", module: "Module", context: Optional[StructDef]) -> None:
-        typedef = self.get_type_def(parser, module, context)
+    def type_check(self, target: TypeDef, context: TypeCheckContext) -> None:
+        typedef = self.get_type_def(context.parser, context.module, context.struct)
         if not is_assignable(typedef, target):
             raise AssignmentError(typedef.name, target.name, self.location)
 
@@ -252,12 +306,12 @@ class ConditionalExpr(Expr):
                                        true_type.name, false_type.name)
         return typedef
 
-    def type_check(self, target: TypeDef, parser: "Parser", module: "Module", context: Optional[StructDef]) -> None:
-        self.condition.type_check(BOOL, parser, module, context)
-        self.true_expr.type_check(target, parser, module, context)
-        self.false_expr.type_check(target, parser, module, context)
+    def type_check(self, target: TypeDef, context: TypeCheckContext) -> None:
+        self.condition.type_check(BOOL, context)
+        self.true_expr.type_check(target, context)
+        self.false_expr.type_check(target, context)
 
-        typedef = self.get_type_def(parser, module, context)
+        typedef = self.get_type_def(context.parser, context.module, context.struct)
         if not is_assignable(typedef, target):
             raise AssignmentError(typedef.name, target.name, self.location)
 
@@ -316,17 +370,17 @@ class BinaryExpr(Expr):
                                        lhs_type.name, rhs_type.name)
         return typedef
 
-    def type_check(self, target: TypeDef, parser: "Parser", module: "Module", context: Optional[StructDef]) -> None:
-        lhs_type = self.lhs.get_type_def(parser, module, context)
-        rhs_type = self.rhs.get_type_def(parser, module, context)
+    def type_check(self, target: TypeDef, context: TypeCheckContext) -> None:
+        lhs_type = self.lhs.get_type_def(context.parser, context.module, context.struct)
+        rhs_type = self.rhs.get_type_def(context.parser, context.module, context.struct)
 
         typedef = unify_types(lhs_type, rhs_type)
         if typedef is None:
             raise TypeUnificationError(self.lhs.location, self.rhs.location,
                                        lhs_type.name, rhs_type.name)
 
-        self.lhs.type_check(typedef, parser, module, context)
-        self.rhs.type_check(typedef, parser, module, context)
+        self.lhs.type_check(typedef, context)
+        self.rhs.type_check(typedef, context)
 
         operator = self.op
         if operator in NUM_OPS:
@@ -428,10 +482,10 @@ class UnaryExpr(Expr):
     def get_type_def(self, parser: "Parser", module: "Module", context: Optional[StructDef]) -> TypeDef:
         return self.expr.get_type_def(parser, module, context)
 
-    def type_check(self, target: TypeDef, parser: "Parser", module: "Module", context: Optional[StructDef]) -> None:
-        self.expr.type_check(target, parser, module, context)
+    def type_check(self, target: TypeDef, context: TypeCheckContext) -> None:
+        self.expr.type_check(target, context)
 
-        typedef = self.expr.get_type_def(parser, module, context)
+        typedef = self.expr.get_type_def(context.parser, context.module, context.struct)
 
         operator = self.op
         if operator == TOK.SUB:
@@ -494,6 +548,20 @@ class Identifier(Expr):
                     NullableType))):
             typedef = NullableType(typedef, field.type_ref.location)
         return typedef
+
+    def type_check(self, target: TypeDef, context: TypeCheckContext) -> None:
+        super().type_check(target, context)
+        fields = context.struct.fields.values()
+        found = False
+        for index, field in enumerate(fields):
+            if index >= context.field_index:
+                break
+            if field.name == self.name:
+                found = True
+                break
+
+        if not found:
+            raise UninitializedFieldError(self.name, self.location)
 
 class FieldAccessExpr(PostfixExpr):
     expr:  Expr
@@ -577,6 +645,14 @@ class ArrayTypeRef(TypeRef):
         else:
             count = self.count.value
         return parser._get_array_type(items, count, self.location)
+
+    def type_check(self, context: TypeCheckContext) -> None:
+        if self.count is None or not isinstance(self.count, Integer):
+            context = context.not_inlined()
+
+        self.item_ref.type_check(context)
+        if self.count:
+            self.count.type_check(UINT64, context)
 
 class PrimitiveType(TypeDef):
     pytype: type
@@ -1062,6 +1138,14 @@ class Parser:
                     finish_queue.append(ref_module)
             index += 1
 
+        # TODO: contstant folding
+
+        # TODO: typecheck phase and calculate struct sizes
+        for module in self._modules:
+            for typedef in module.declared_types.values():
+                if isinstance(typedef, StructDef):
+                    typedef.type_check(self, module)
+
         return module
 
     def _try_finish_module(self, module: Module) -> bool:
@@ -1174,8 +1258,6 @@ class Parser:
 
         while self._has_next():
             self._parse_struct_def()
-
-        # TODO: typecheck phase and calculate struct sizes
 
     def _parse_file_attribute(self) -> None:
         self._expect(TOK.BANG)

@@ -67,6 +67,15 @@ class IllegalReferenceError(ParserError):
         self.name     = name
         self.location = location
 
+class UninitializedFieldError(ParserError):
+    name: str
+    location: Span
+
+    def __init__(self, name: str, location: Span, message: Optional[str] = None):
+        super().__init__(message or f"field {name} is not initialized at this point")
+        self.name     = name
+        self.location = location
+
 class FieldAccessError(ParserError):
     name: str
     location: Span
@@ -118,6 +127,17 @@ class UnbalancedParanthesesError(ParserError):
         self.close_at  = close_at
         self.open_tok  = open_tok
         self.close_tok = close_tok
+
+class CircularTypeError(BFDLError):
+    name: str
+    definition: Span
+    reference:  Span
+
+    def __init__(self, name: str, definition: Span, reference: Span, message: Optional[str] = None):
+        super().__init__(message or f"type {name} is circular")
+        self.name = name
+        self.definition = definition
+        self.reference  = reference
 
 class BFDLTypeError(BFDLError):
     location: Span
