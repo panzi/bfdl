@@ -30,13 +30,13 @@ ImportRef ::= Identifier ["as" Identifier]
 
 StructDef ::= Attribute*
            "struct" Identifier "{"
-               ( Field | ConditionalSection ) *
+               ( FieldDef | ConditionalSection ) *
            "}"
 
-Field ::= Attribute* Type Identifier [ "=" Value ] ";"
+FieldDef ::= Attribute* Type Identifier [ "=" Value ] ";"
 
 ConditionalSection ::= "if" "(" Expression ")" "{"
-                           ( Field | ConditionalSection ) *
+                           ( FieldDef | ConditionalSection ) *
                        "}"
 
 Type ::= PrimitiveType | ArrayType | TypeName
@@ -44,12 +44,17 @@ Type ::= PrimitiveType | ArrayType | TypeName
 TypeName ::= Identifier
 
 ArrayType ::= Type "[" "]"
+            | Type "[" IntegerType "]"
             | Type "[" Integer "]"
             | Type "[" Expression "]"
 
-PrimitiveType ::= "byte" | "uint8" | "int8" | "uint16" | "int16"
-                | "uint32" | "int32" | "uint64" | "int64"
-                | "float" | "double" | "bool"
+IntegerType ::= "byte" | "uint8" | "int8" | "uint16" | "int16"
+              | "uint32" | "int32" | "uint64" | "int64"
+              | "uint128" | "int128"
+
+FloatType ::= "float" | "double"
+
+PrimitiveType ::= IntegerType | FloatType | "bool"
 
 # Not sure if I want to keep the "#" for attributes or
 # if the brackets are enough.

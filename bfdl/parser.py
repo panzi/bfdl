@@ -3,7 +3,7 @@
 import re
 from collections import OrderedDict
 from contextlib import contextmanager
-from typing import List, Optional, Iterator, Dict, Union, Set, Tuple, Any, Generator, Match
+from typing import List, Optional, Iterator, Dict, Union, Set, Tuple, Any, Generator, Match, Type
 from os.path import abspath, join as join_path, dirname
 from enum import Enum
 
@@ -129,7 +129,7 @@ class FieldDef(ASTNode):
 
     @property
     def fixed(self) -> bool:
-        return bool(self.attributes.get('fixed', False))
+        return self.attributes.fixed
 
     def fold(self) -> None:
         self.type_ref = self.type_ref.fold()
@@ -416,62 +416,78 @@ class BinaryExpr(Expr):
         operator = self.op
 
         if isinstance(lhs, Number) and isinstance(rhs, Number):
-            if operator == TOK.ADD:
-                return lhs + rhs
+            if operator not in NUM_OPS:
+                typedef = unify_types(lhs.get_type_def(), rhs.get_type_def())
 
-            if operator == TOK.SUB:
-                return lhs - rhs
+                cls: Type[Number]
+                if isinstance(typedef, IntegerType):
+                    cls = Integer
+                elif isinstance(typedef, FloatType):
+                    cls = Float
+                else:
+                    assert False
 
-            if operator == TOK.MUL:
-                return lhs * rhs
+                if operator == TOK.ADD:
+                    return cls(lhs.value + rhs.value, typedef, self.location)
 
-            if operator == TOK.DIV:
-                return lhs / rhs
+                if operator == TOK.SUB:
+                    return cls(lhs.value - rhs.value, typedef, self.location)
 
-            if operator == TOK.MOD:
-                return lhs % rhs
+                if operator == TOK.MUL:
+                    return cls(lhs.value * rhs.value, typedef, self.location)
 
-            if operator == TOK.LT:
-                return lhs.lt(rhs)
+                if operator == TOK.DIV:
+                    if cls is Integer:
+                        return cls(lhs.value // rhs.value, typedef, self.location)
+                    else:
+                        return cls(lhs.value / rhs.value, typedef, self.location)
 
-            if operator == TOK.GT:
-                return lhs.gt(rhs)
+                if operator == TOK.MOD:
+                    return cls(lhs.value % rhs.value, typedef, self.location)
+            else:
+                if operator == TOK.LT:
+                    return Bool(lhs.value < rhs.value, self.location)
 
-            if operator == TOK.LE:
-                return lhs.le(rhs)
+                if operator == TOK.GT:
+                    return Bool(lhs.value > rhs.value, self.location)
 
-            if operator == TOK.GE:
-                return lhs.ge(rhs)
+                if operator == TOK.LE:
+                    return Bool(lhs.value <= rhs.value, self.location)
+
+                if operator == TOK.GE:
+                    return Bool(lhs.value >= rhs.value, self.location)
 
         if isinstance(lhs, Bool) and isinstance(rhs, Bool):
             if operator == TOK.OR:
-                return lhs.or_(rhs)
+                return Bool(lhs.value or rhs.value, self.location)
 
             if operator == TOK.AND:
-                return lhs.and_(rhs)
+                return Bool(lhs.value and rhs.value, self.location)
 
         if isinstance(lhs, Integer) and isinstance(rhs, Integer):
+            typedef = unify_types(lhs.get_type_def(), rhs.get_type_def())
+
             if operator == TOK.BAND:
-                return lhs & rhs
+                return Integer(lhs.value & rhs.value, typedef, self.location)
 
             if operator == TOK.BOR:
-                return lhs | rhs
+                return Integer(lhs.value | rhs.value, typedef, self.location)
 
             if operator == TOK.XOR:
-                return lhs ^ rhs
+                return Integer(lhs.value ^ rhs.value, typedef, self.location)
 
             if operator == TOK.LSHIFT:
-                return lhs << rhs
+                return Integer(lhs.value << rhs.value, typedef, self.location)
 
             if operator == TOK.RSHIFT:
-                return lhs >> rhs
+                return Integer(lhs.value >> rhs.value, typedef, self.location)
 
         if isinstance(lhs, Value) and isinstance(rhs, Value):
             if operator == TOK.EQ:
-                return lhs.eq(rhs)
+                return Bool(lhs.value == rhs.value, self.location)
 
             if operator == TOK.NE:
-                return lhs.ne(rhs)
+                return Bool(lhs.value != rhs.value, self.location)
 
         if lhs is not self.lhs or rhs is not self.rhs:
             return BinaryExpr(lhs, rhs, operator, self.location)
@@ -521,13 +537,13 @@ class UnaryExpr(Expr):
 
         operator = self.op
         if isinstance(expr, Number) and operator == TOK.SUB:
-            return expr.negate()
+            return type(expr)(-expr.value, expr.typedef, expr.location)
 
         if isinstance(expr, Integer) and operator == TOK.BNOT:
-            return expr.bnot()
+            return Integer(~expr.value, expr.typedef, expr.location)
 
         if isinstance(expr, Bool) and operator == TOK.BANG:
-            return expr.not_()
+            return Bool(not expr.value, expr.location)
 
         if expr is self.expr:
             return self
@@ -635,34 +651,42 @@ class ArrayItemAccessExpr(PostfixExpr):
 
 class ArrayTypeRef(TypeRef):
     item_ref: TypeRef
-    count:    Optional[Expr]
+    count:    Union[Expr, IntegerType]
 
-    def __init__(self, item_ref: TypeRef, count: Optional[Expr], location: Span):
-        if count is None or not isinstance(count, Integer):
-            count_val = None
+    def __init__(self, item_ref: TypeRef, count: Union[Expr, IntegerType], location: Span):
+        if isinstance(count, Expr):
+            count = count.fold()
+
+        if isinstance(count, IntegerType):
+            count_str = count.name
+        elif isinstance(count, Integer):
+            count_str = str(count.value)
         else:
-            count_val = count.value
+            count_str = ''
+
         super().__init__(
-            f"{item_ref.name}[]" if count_val is None else f"{item_ref.name}[{count_val}]",
+            f"{item_ref.name}[{count_str}]",
             location)
         self.item_ref = item_ref
         self.count    = count
 
     def fold(self) -> "ArrayTypeRef":
-        count = self.count.fold() if self.count is not None else None
         item_ref = self.item_ref.fold()
 
-        if count is not self.count or item_ref is not self.item_ref:
-            return ArrayTypeRef(item_ref, count, self.location)
+        if item_ref is not self.item_ref:
+            return ArrayTypeRef(item_ref, self.count, self.location)
 
         return self
 
     def resolve(self, parser: "Parser", module: "Module") -> TypeDef:
         items = self.item_ref.resolve(parser, module)
-        if self.count is None or not isinstance(self.count, Integer):
-            count = None
-        else:
+        count: Union[int, IntegerType, None]
+        if isinstance(self.count, IntegerType):
+            count = self.count
+        elif isinstance(self.count, Integer):
             count = self.count.value
+        else:
+            count = None
         return parser._get_array_type(items, count, self.location)
 
     def type_check(self, context: TypeCheckContext) -> None:
@@ -670,7 +694,7 @@ class ArrayTypeRef(TypeRef):
             context = context.not_inlined()
 
         self.item_ref.type_check(context)
-        if self.count:
+        if isinstance(self.count, Expr):
             self.count.type_check(SIZE, context)
 
 class PrimitiveType(TypeDef):
@@ -711,7 +735,7 @@ DOUBLE  = FloatType(float, 8, "double")
 
 SIZE = UINT64
 
-PRIMITIVE_MAP = dict((tp.name, tp) for tp in [
+PRIMITIVE_MAP: Dict[str, PrimitiveType] = dict((tp.name, tp) for tp in [
     UINT8, INT8, BYTE, UINT16, INT16, UINT32, INT32,
     UINT64, INT64, UINT128, INT128, BOOL, FLOAT, DOUBLE,
 ])
@@ -725,6 +749,8 @@ UINTS = frozenset((UINT8, BYTE, UINT16, UINT32, UINT64, UINT128))
 SINTS = frozenset((INT8, INT16, INT32, INT64, INT128))
 
 INTS = UINTS | SINTS
+
+INTEGER_MAP: Dict[str, IntegerType] = dict((tp.name, tp) for tp in INTS)
 
 FLOATS = frozenset((FLOAT, DOUBLE))
 
@@ -771,11 +797,15 @@ class PrimitiveValue(AtomicValue):
     value: Union[int, float, bool]
     typedef: Optional[TypeDef]
 
-    def __init__(self, typedef: Optional[TypeDef], location: Span):
+    def __init__(self, value: Union[int, float, bool], typedef: Optional[TypeDef], location: Span):
         super().__init__(location)
+        self.value   = value
         self.typedef = typedef
 
-    def get_type_def(self, parser: "Parser", module: "Module", context: Optional[StructDef]) -> TypeDef:
+    def get_type_def(self,
+                     parser: Optional["Parser"]=None,
+                     module: Optional["Module"]=None,
+                     context: Optional[StructDef]=None) -> TypeDef:
         if self.typedef is None:
             value = self.value
             if isinstance(value, int):
@@ -810,104 +840,26 @@ class PrimitiveValue(AtomicValue):
 
         return self.typedef
 
-    def lt(self, other: Value) -> Value:
-        return Bool(self.value < other.value, self.location)
-
-    def gt(self, other: Value) -> Value:
-        return Bool(self.value > other.value, self.location)
-
-    def le(self, other: Value) -> Value:
-        return Bool(self.value <= other.value, self.location)
-
-    def ge(self, other: Value) -> Value:
-        return Bool(self.value >= other.value, self.location)
-
 class Number(PrimitiveValue):
-    def __add__(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def __sub__(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def __mul__(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def __truediv__(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def __mod__(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def negate(self) -> Expr:
-        raise NotImplementedError
-
-    def lt(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def gt(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def le(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def ge(self, other: Value) -> Value:
-        raise NotImplementedError
+    pass
 
 class Integer(Number):
     value: int
 
     def __init__(self, value: int, typedef: Optional[TypeDef], location: Span):
-        super().__init__(typedef, location)
-        self.value = value
-
-    def __and__(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def __or__(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def __xor__(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def __lshift__(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def __rshift__(self, other: Value) -> Value:
-        raise NotImplementedError
-
-    def bnot(self) -> Expr:
-        # TODO: signed?
-        return Integer(~self.value, self.typedef, self.location)
-
-    def negate(self) -> Expr:
-        # TODO: convert unsigned to singed type?
-        return Integer(-self.value, self.typedef, self.location)
+        super().__init__(value, typedef, location)
 
 class Float(Number):
     value: float
 
     def __init__(self, value: float, typedef: Optional[TypeDef], location: Span):
-        super().__init__(typedef, location)
-        self.value = value
-
-    def negate(self) -> Expr:
-        return Float(-self.value, self.typedef, self.location)
+        super().__init__(value, typedef, location)
 
 class Bool(PrimitiveValue):
     value: bool
 
     def __init__(self, value: bool, location: Span):
-        super().__init__(BOOL, location)
-        self.value = value
-
-    def not_(self) -> Expr:
-        return Bool(not self.value, self.location)
-
-    def and_(self, other: Value) -> Value:
-        return Bool(bool(self.value and other.value), self.location)
-
-    def or_(self, other: Value) -> Value:
-        return Bool(bool(self.value or other.value), self.location)
+        super().__init__(value, BOOL, location)
 
 class String(AtomicValue):
     value: str
@@ -981,21 +933,29 @@ class ConditionalSection(Section):
         self.condition = condition
         self.sections  = sections
 
-def _array_type_info(items: TypeDef, count: Optional[int]) -> Tuple[str, Optional[int]]:
+def _array_type_info(items: TypeDef, count: Union[int, IntegerType, None]) -> Tuple[str, Optional[int]]:
     item_size = items.size
     size: Optional[int]
-    if item_size is not None and count is not None:
+    if item_size is not None and isinstance(count, int):
         size = item_size * count
     else:
         size = None
-    name = f'{items.name}[{count}]' if count is not None else f'{items.name}[]'
+
+    if isinstance(count, int):
+        count_str = str(count)
+    elif isinstance(count, IntegerType):
+        count_str = count.name
+    else:
+        count_str = ''
+
+    name = f'{items.name}[{count_str}]'
     return (name, size)
 
 class ArrayTypeDef(TypeDef):
     items: TypeDef
-    count: Optional[int]
+    count: Union[int, IntegerType, None]
 
-    def __init__(self, items: TypeDef, count: Optional[int], location: Span):
+    def __init__(self, items: TypeDef, count: Union[int, IntegerType, None], location: Span):
         name, size = _array_type_info(items, count)
         super().__init__(name, size, location)
         self.items = items
@@ -1003,9 +963,9 @@ class ArrayTypeDef(TypeDef):
 
 class Attribute(ASTNode):
     name: str
-    value: Union[Value, TypeRef, Identifier, None]
+    value: Union[Value, TypeDef, Identifier, None]
 
-    def __init__(self, name: str, value: Union[Value, TypeRef, Identifier, None], location: Span):
+    def __init__(self, name: str, value: Union[Value, TypeDef, Identifier, None], location: Span):
         super().__init__(location)
         self.name  = name
         self.value = value
@@ -1042,6 +1002,16 @@ class Attributes:
             other = self.defined_attrs[attr.name]
             raise AttributeRedeclaredError(attr.name, other.location, attr.location)
         self.defined_attrs[attr.name] = attr
+
+    @property
+    def fixed(self) -> bool:
+        return bool(self.get('fixed', False))
+
+    @property
+    def size_type(self) -> IntegerType:
+        ident = self['size_type'].value
+        assert isinstance(ident, Identifier)
+        return INTEGER_MAP[ident.name]
 
 class ImportSymbol:
     name: Identifier
@@ -1099,6 +1069,12 @@ class Module:
 PRELUDE = Module(0, '<prelude>', '')
 PRELUDE.state = ModuleState.FINISHED
 
+GLOBAL_ATTRS = Attributes(
+    dict((attr.name, attr) for attr in [
+        Attribute('size_type', Identifier(SIZE.name, Span(0, 0, 0)), Span(0, 0, 0))
+    ])
+)
+
 class Parser:
     _root_path:      str
     _module_map:     Dict[str, int]
@@ -1107,6 +1083,7 @@ class Parser:
     _tokens:         Iterator[Atom]
     _current_token:  Optional[Atom]
     _current_module: Module
+    _current_attrs:  Attributes
     _array_types:    Dict[Tuple[int, str], ArrayTypeDef]
 
     def __init__(self, root_path: str = '.'):
@@ -1117,8 +1094,9 @@ class Parser:
         self._tokens         = iter(())
         self._current_token  = None
         self._current_module = PRELUDE
+        self._current_attrs  = GLOBAL_ATTRS
 
-    def _get_array_type(self, items: TypeDef, count: Optional[int], location: Span) -> ArrayTypeDef:
+    def _get_array_type(self, items: TypeDef, count: Union[int, IntegerType, None], location: Span) -> ArrayTypeDef:
         name, _ = _array_type_info(items, count)
         key = (location.fileid, name)
         if key in self._array_types:
@@ -1147,8 +1125,10 @@ class Parser:
             self._tokens         = tokenize(other_module.source, other_fileid)
             self._current_token  = None
             self._current_module = other_module
+            self._current_attrs  = other_module.attributes
             self._parse_module()
             self._current_module = PRELUDE
+            self._current_attrs  = GLOBAL_ATTRS
 
             other_module.state = ModuleState.LOADED
 
@@ -1304,15 +1284,13 @@ class Parser:
         self._expect(TOK.HASH)
         with self._expect_paren(TOK.CUR_OPEN):
             name_tok = self._expect(TOK.ID)
-            value: Union[Value, TypeRef, Identifier, None]
+            value: Union[Value, Identifier, None]
 
             if self._has_next(TOK.ASSIGN):
                 self._next_token()
 
                 if self._has_next(TOK.ID):
                     value = self._parse_id()
-                elif self._has_next(TOK.TYPE):
-                    value = self._parse_type_ref()
                 else:
                     value = self._parse_value()
             else:
@@ -1415,10 +1393,12 @@ class Parser:
 
     def _parse_struct_def(self) -> None:
         cur = self._cursor()
-        attrs = Attributes(parent=self._current_module.attributes)
+        parent_attrs = self._current_module.attributes
+        attrs = Attributes(parent=parent_attrs)
         while self._has_next(TOK.HASH):
             attr = self._parse_attribute()
             attrs.declare(attr)
+        self._current_attrs = attrs
 
         self._expect(TOK.STRUCT)
         name_id = self._parse_id()
@@ -1451,6 +1431,7 @@ class Parser:
                     fields[field.name] = field
                     section.field_count += 1
 
+        self._current_attrs = parent_attrs
         # TODO: resolve size after typecheck phase
         struct_def = StructDef(name, self._span(cur), fields, None, sections)
         self._current_module.declare(name, struct_def)
@@ -1489,10 +1470,12 @@ class Parser:
 
     def _parse_field_def(self) -> FieldDef:
         cur = self._cursor()
-        attrs = Attributes()
+        parent_attrs = self._current_attrs
+        attrs = Attributes(parent=parent_attrs)
         while self._has_next(TOK.HASH):
             attr = self._parse_attribute()
             attrs.declare(attr)
+        self._current_attrs = attrs
 
         type_ref = self._parse_type_ref()
         optional = False
@@ -1509,6 +1492,7 @@ class Parser:
             value = None
 
         self._expect(TOK.SEMICOL)
+        self._current_attrs = parent_attrs
 
         return FieldDef(name_tok.value, type_ref, value, optional, attrs, self._span(cur))
 
@@ -1519,11 +1503,13 @@ class Parser:
 
         while self._has_next(TOK.BR_OPEN):
             with self._expect_paren(TOK.BR_OPEN):
-                size: Optional[Expr]
+                size: Union[Expr, IntegerType]
                 if not self._has_next(TOK.BR_CLOSE):
                     size = self._parse_expr()
+                    if isinstance(size, Identifier) and size.name in INTEGER_MAP:
+                        size = INTEGER_MAP[size.name]
                 else:
-                    size = None
+                    size = self._current_attrs.size_type
             type_ref = ArrayTypeRef(type_ref, size, self._span(cur))
 
         return type_ref
