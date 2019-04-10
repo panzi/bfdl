@@ -266,9 +266,18 @@ def is_assignable(source: TypeDef, target: TypeDef) -> bool:
     if isinstance(target, NullableType):
         return is_assignable(source, target.typedef)
 
-    # TODO: static arrays values should be assignable to dynamic array fields
+    # static arrays values should be assignable to dynamic array fields etc.
+    if isinstance(source, ArrayTypeDef) and isinstance(target, ArrayTypeDef):
+        if not is_assignable(source.items, target.items):
+            return False
 
-    if not isinstance(target, PrimitiveType) or not isinstance(source, PrimitiveType):
+        if target.count is None or isinstance(target.count, IntegerType):
+            # well, integer overflow of size field is possible
+            return True
+
+        if source.count == target.count:
+            return True
+
         return False
 
     if isinstance(source, IntegerType) and isinstance(target, IntegerType):
