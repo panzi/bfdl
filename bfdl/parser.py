@@ -503,8 +503,6 @@ class BinaryExpr(Expr):
 
         return self
 
-# TODO: more constant folding and type checking
-
 class UnaryExpr(Expr):
     op:   TOK
     expr: Expr
@@ -630,6 +628,17 @@ class FieldAccessExpr(PostfixExpr):
 
         return typedef
 
+    def type_check(self, target: TypeDef, context: TypeCheckContext) -> None:
+        typedef = self.get_type_def(context.parser, context.module, context.struct)
+        if not is_assignable(typedef, target):
+            raise AssignmentError(typedef.name, target.name, self.location)
+
+    def fold(self) -> Expr:
+        expr = self.expr.fold()
+        if expr is not self.expr:
+            return FieldAccessExpr(expr, self.field, self.location)
+        return self
+
 class ArrayItemAccessExpr(PostfixExpr):
     array: Expr
     item:  Expr
@@ -657,6 +666,23 @@ class ArrayItemAccessExpr(PostfixExpr):
             typedef = NullableType(typedef, self.item.location)
 
         return typedef
+
+    def type_check(self, target: TypeDef, context: TypeCheckContext) -> None:
+        typedef = self.get_type_def(context.parser, context.module, context.struct)
+        if not is_assignable(typedef, target):
+            raise AssignmentError(typedef.name, target.name, self.location)
+
+    def fold(self) -> Expr:
+        array = self.array.fold()
+        item  = self.item.fold()
+
+#        if isinstance(array, ArrayLiteral) and isinstance(item, Integer):
+#            value = array.value[item.value]
+            # XXX: need to be able to resolve the type and then create an expression from that type
+
+        if array is not self.array or item is not self.item:
+            return ArrayItemAccessExpr(array, item, self.location)
+        return self
 
 class ArrayTypeRef(TypeRef):
     item_ref: TypeRef
