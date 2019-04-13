@@ -72,12 +72,14 @@ class ASTNode:
 
 class TypeDef(ASTNode):
     name: str
+    attributes: "Attributes"
     size: Optional[int]
 
-    def __init__(self, name: str, size: Optional[int], location: Span):
+    def __init__(self, name: str, attributes: "Attributes", size: Optional[int], location: Span):
         super().__init__(location)
-        self.name = name
-        self.size = size
+        self.name       = name
+        self.attributes = attributes
+        self.size       = size
 
     def __hash__(self) -> int:
         return hash((self.location.fileid, self.name))
@@ -91,10 +93,12 @@ class TypeDef(ASTNode):
 
 class TypeRef(ASTNode):
     name: str
+    attributes: "Attributes"
 
-    def __init__(self, name: str, location: Span):
+    def __init__(self, name: str, attributes: "Attributes", location: Span):
         super().__init__(location)
-        self.name = name
+        self.name       = name
+        self.attributes = attributes
 
     def fold(self) -> "TypeRef":
         return self
@@ -150,9 +154,10 @@ class StructDef(TypeDef):
     fields:   Dict[str, FieldDef] # OrderedDict
     sections: List[Section]
 
-    def __init__(self, name: str, location: Span, fields: Optional[Dict[str, FieldDef]] = None,
+    def __init__(self, name: str, attributes: "Attributes", location: Span,
+                 fields: Optional[Dict[str, FieldDef]] = None,
                  size: Optional[int] = None, sections: Optional[List[Section]] = None):
-        super().__init__(name, size, location)
+        super().__init__(name, attributes, size, location)
         self.fields   = fields if fields is not None else OrderedDict()
         self.sections = sections if sections is not None else []
 
@@ -579,7 +584,7 @@ class Identifier(Expr):
                 (field.default is not None and isinstance(
                     field.default.get_type_def(parser, module, context),
                     NullableType))):
-            typedef = NullableType(typedef, field.type_ref.location)
+            typedef = NullableType(typedef, typedef.attributes, field.type_ref.location)
         return typedef
 
     def type_check(self, target: TypeDef, context: TypeCheckContext) -> None:
@@ -624,7 +629,7 @@ class FieldAccessExpr(PostfixExpr):
         typedef = field.type_ref.resolve(parser, module)
 
         if nullable and not isinstance(typedef, NullableType):
-            typedef = NullableType(typedef, self.field.location)
+            typedef = NullableType(typedef, typedef.attributes, self.field.location)
 
         return typedef
 
@@ -663,7 +668,7 @@ class ArrayItemAccessExpr(PostfixExpr):
         typedef = array_def.items
 
         if nullable and not isinstance(typedef, NullableType):
-            typedef = NullableType(typedef, self.item.location)
+            typedef = NullableType(typedef, typedef.attributes, self.item.location)
 
         return typedef
 
@@ -685,12 +690,13 @@ class ArrayItemAccessExpr(PostfixExpr):
         return self
 
 class PointerTypeRef(TypeRef):
-    offset_type: Optional[IntegerType]
+    offset_type: IntegerType
     item_ref:    TypeRef
 
-    def __init__(self, offset_type: Optional[IntegerType], item_ref: TypeRef, location: Span):
-        offset_name = offset_type.name if offset_type is not None else ''
-        super().__init__(f'{offset_name}->{item_ref.name}', location)
+    def __init__(self, offset_type: Optional[IntegerType], item_ref: TypeRef, attributes: "Attributes", location: Span):
+        if offset_type is None:
+            offset_type = attributes.offset_type
+        super().__init__(f'{item_ref.name}*<{offset_type.name}>', attributes, location)
         self.offset_type = offset_type
         self.item_ref    = item_ref
 
@@ -698,13 +704,12 @@ class PointerTypeRef(TypeRef):
         item_ref = self.item_ref.fold()
 
         if item_ref is not self.item_ref:
-            return PointerTypeRef(self.offset_type, item_ref, self.location)
+            return PointerTypeRef(self.offset_type, item_ref, self.attributes, self.location)
 
         return self
 
     def resolve(self, parser: "Parser", module: "Module") -> TypeDef:
-        item = self.item_ref.resolve(parser, module)
-        return parser._get_pointer_type(self.offset_type, item, self.location)
+        return parser._get_pointer_type(self, module)
 
     def type_check(self, context: TypeCheckContext) -> None:
         self.item_ref.type_check(context)
@@ -713,7 +718,7 @@ class ArrayTypeRef(TypeRef):
     item_ref: TypeRef
     count:    Union[Expr, IntegerType]
 
-    def __init__(self, item_ref: TypeRef, count: Union[Expr, IntegerType], location: Span):
+    def __init__(self, item_ref: TypeRef, count: Union[Expr, IntegerType], attributes: "Attributes", location: Span):
         if isinstance(count, Expr):
             count = count.fold()
 
@@ -726,6 +731,7 @@ class ArrayTypeRef(TypeRef):
 
         super().__init__(
             f"{item_ref.name}[{count_str}]",
+            attributes,
             location)
         self.item_ref = item_ref
         self.count    = count
@@ -734,20 +740,12 @@ class ArrayTypeRef(TypeRef):
         item_ref = self.item_ref.fold()
 
         if item_ref is not self.item_ref:
-            return ArrayTypeRef(item_ref, self.count, self.location)
+            return ArrayTypeRef(item_ref, self.count, self.attributes, self.location)
 
         return self
 
     def resolve(self, parser: "Parser", module: "Module") -> TypeDef:
-        items = self.item_ref.resolve(parser, module)
-        count: Union[int, IntegerType, None]
-        if isinstance(self.count, IntegerType):
-            count = self.count
-        elif isinstance(self.count, Integer):
-            count = self.count.value
-        else:
-            count = None
-        return parser._get_array_type(items, count, self.location)
+        return parser._get_array_type(self, module)
 
     def type_check(self, context: TypeCheckContext) -> None:
         if self.count is None or not isinstance(self.count, Integer):
@@ -755,14 +753,14 @@ class ArrayTypeRef(TypeRef):
 
         self.item_ref.type_check(context)
         if isinstance(self.count, Expr):
-            self.count.type_check(SIZE, context)
+            self.count.type_check(self.attributes.get('array_size', SIZE), context)
 
 class PrimitiveType(TypeDef):
     pytype: type
     size:   int
 
-    def __init__(self, pytype: type, size: int, name: str, location: Optional[Span] = None):
-        super().__init__(name, size, location or Span(0, 0, 0))
+    def __init__(self, pytype: type, size: int, name: str, attributes: Optional[Attributes] = None, location: Optional[Span] = None):
+        super().__init__(name, attributes or GLOBAL_ATTRS, size, location or Span(0, 0, 0))
         self.pytype = pytype
 
 class NumberType(PrimitiveType):
@@ -771,8 +769,10 @@ class NumberType(PrimitiveType):
 class IntegerType(NumberType):
     signed: bool
 
-    def __init__(self, pytype: type, size: int, name: str, signed: bool=False, location: Optional[Span] = None):
-        super().__init__(pytype, size, name, location)
+    def __init__(self, pytype: type, size: int, name: str, signed: bool=False,
+                 attributes: Optional[Attributes] = None,
+                 location: Optional[Span] = None):
+        super().__init__(pytype, size, name, attributes, location)
         self.signed = signed
 
 class FloatType(NumberType):
@@ -817,25 +817,26 @@ FLOATS = frozenset((FLOAT, DOUBLE))
 NUMBERS = INTS | FLOATS
 
 class NeverType(TypeDef):
-    def __init__(self, name: str, location: Optional[Span] = None):
-        super().__init__(name, 0, location or Span(0, 0, 0))
+    def __init__(self, name: str, attributes: Optional[Attributes] = None, location: Optional[Span] = None):
+        super().__init__(name, attributes or GLOBAL_ATTRS, 0, location or Span(0, 0, 0))
 
 NEVER = NeverType('never')
 
 class NullableType(TypeDef):
     typedef: TypeDef
 
-    def __init__(self, typedef: TypeDef, location: Optional[Span] = None):
+    def __init__(self, typedef: TypeDef, attributes: Optional[Attributes] = None, location: Optional[Span] = None):
         name = typedef.name + '?'
-        super().__init__(name, typedef.size, location or Span(0, 0, 0))
+        super().__init__(name, attributes or GLOBAL_ATTRS, typedef.size, location or Span(0, 0, 0))
         self.typedef = typedef
 
 NULL = NullableType(NEVER)
 
 class StringType(TypeDef):
-    pass
+    def __init__(self, name: str, size: Optional[int] = None, attributes: Optional[Attributes] = None, location: Optional[Span] = None):
+        super().__init__(name, attributes or GLOBAL_ATTRS, size, location or Span(0, 0, 0))
 
-STRING = StringType("string", None, Span(0, 0, 0))
+STRING = StringType("string")
 
 class Value(Expr):
     value: Any
@@ -1015,9 +1016,9 @@ class ArrayTypeDef(TypeDef):
     items: TypeDef
     count: Union[int, IntegerType, None]
 
-    def __init__(self, items: TypeDef, count: Union[int, IntegerType, None], location: Span):
+    def __init__(self, items: TypeDef, count: Union[int, IntegerType, None], attributes: Attributes, location: Span):
         name, size = _array_type_info(items, count)
-        super().__init__(name, size, location)
+        super().__init__(name, attributes, size, location)
         self.items = items
         self.count = count
 
@@ -1025,8 +1026,8 @@ class PointerTypeDef(TypeDef):
     offset: IntegerType
     item:   TypeDef
 
-    def __init__(self, offset: IntegerType, item: TypeDef, location: Span):
-        super().__init__(f'{offset.name}->{item.name}', offset.size, location)
+    def __init__(self, offset: IntegerType, item: TypeDef, attributes: Attributes, location: Span):
+        super().__init__(f'{item.name}*<{offset.name}>', attributes, offset.size, location)
         self.offset = offset
         self.item   = item
 
@@ -1079,6 +1080,12 @@ class Attributes:
     @property
     def size_type(self) -> IntegerType:
         ident = self['size_type'].value
+        assert isinstance(ident, Identifier)
+        return INTEGER_MAP[ident.name]
+
+    @property
+    def offset_type(self) -> IntegerType:
+        ident = self['offset_type'].value
         assert isinstance(ident, Identifier)
         return INTEGER_MAP[ident.name]
 
@@ -1140,7 +1147,8 @@ PRELUDE.state = ModuleState.FINISHED
 
 GLOBAL_ATTRS = Attributes(
     dict((attr.name, attr) for attr in [
-        Attribute('size_type', Identifier(SIZE.name, Span(0, 0, 0)), Span(0, 0, 0))
+        Attribute('size_type',   Identifier(SIZE.name, Span(0, 0, 0)), Span(0, 0, 0)),
+        Attribute('offset_type', Identifier(SIZE.name, Span(0, 0, 0)), Span(0, 0, 0)),
     ])
 )
 
@@ -1168,22 +1176,33 @@ class Parser:
         self._array_types    = {}
         self._pointer_types  = {}
 
-    def _get_array_type(self, items: TypeDef, count: Union[int, IntegerType, None], location: Span) -> ArrayTypeDef:
+    def _get_array_type(self, type_ref: ArrayTypeRef, module: Module) -> ArrayTypeDef:
+        items = type_ref.item_ref.resolve(self, module)
+        count: Union[int, IntegerType, None]
+        if isinstance(type_ref.count, IntegerType):
+            count = type_ref.count
+        elif isinstance(type_ref.count, Integer):
+            count = type_ref.count.value
+        else:
+            count = None
+
         name, _ = _array_type_info(items, count)
         key = (items.location.fileid, name)
         if key in self._array_types:
             return self._array_types[key]
 
-        typedef = ArrayTypeDef(items, count, location)
+        typedef = ArrayTypeDef(items, count, type_ref.attributes, type_ref.location)
         self._array_types[key] = typedef
         return typedef
 
-    def _get_pointer_type(self, offset: IntegerType, item: TypeDef, location: Span) -> PointerTypeDef:
-        name = f'{offset.name}->{item.name}'
+    def _get_pointer_type(self, type_ref: PointerTypeRef, module: Module) -> PointerTypeDef:
+        item = type_ref.item_ref.resolve(self, module)
+        offset = type_ref.offset_type
+        name = f'{item.name}*<{offset.name}>'
         key = (item.location.fileid, name)
         if key in self._pointer_types:
             return self._pointer_types[key]
-        typedef = PointerTypeDef(offset, item, location)
+        typedef = PointerTypeDef(offset, item, type_ref.attributes, type_ref.location)
         self._pointer_types[key] = typedef
         return typedef
 
@@ -1514,7 +1533,7 @@ class Parser:
 
         self._current_attrs = parent_attrs
         # TODO: resolve size after typecheck phase
-        struct_def = StructDef(name, self._span(cur), fields, None, sections)
+        struct_def = StructDef(name, attrs, self._span(cur), fields, None, sections)
         self._current_module.declare(name, struct_def)
 
     def _parse_conditional_section(self, fields: Dict[str, FieldDef], stack: List[Expr]) -> ConditionalSection:
@@ -1579,8 +1598,15 @@ class Parser:
 
     def _parse_type_ref(self) -> TypeRef:
         cur = self._cursor()
+        parent_attrs = self._current_attrs
+        attrs = Attributes(parent=parent_attrs)
+        while self._has_next(TOK.HASH):
+            attr = self._parse_attribute()
+            attrs.declare(attr)
+        self._current_attrs = attrs
+
         name_tok = self._expect(TOK.ID)
-        type_ref = TypeRef(name_tok.value, cur.to_span())
+        type_ref = TypeRef(name_tok.value, attrs, cur.to_span())
 
         while self._has_next(TOK.BR_OPEN) or self._has_next(TOK.MUL):
             if self._has_next(TOK.BR_OPEN):
@@ -1592,18 +1618,20 @@ class Parser:
                             # XXX: not future safe for type aliases or custom integer types
                             size = INTEGER_MAP[size.name]
                     else:
-                        size = self._current_attrs.size_type
-                type_ref = ArrayTypeRef(type_ref, size, self._span(cur))
+                        size = attrs.size_type
+                type_ref = ArrayTypeRef(type_ref, size, attrs, self._span(cur))
             else:
                 self._next_token()
-                offset: Optional[IntegerType] = None
+                offset: IntegerType
                 if self._has_next(TOK.LT):
                     with self._expect_paren(TOK.LT):
                         ident = self._parse_id()
                         # XXX: not future safe for type aliases or custom integer types
                         offset = INTEGER_MAP[ident.name]
-                type_ref = PointerTypeRef(offset, type_ref, self._span(cur))
-
+                else:
+                    offset = attrs.offset_type
+                type_ref = PointerTypeRef(offset, type_ref, attrs, self._span(cur))
+        self._current_attrs = parent_attrs
         return type_ref
 
     def _parse_int(self) -> Integer:
@@ -1723,7 +1751,11 @@ class Parser:
 
         return ArrayLiteral(
             value,
-            ArrayTypeRef(TypeRef(BYTE.name, cur.to_span()), Integer(len(value), SIZE, cur.to_span()), cur.to_span()),
+            ArrayTypeRef(
+                TypeRef(BYTE.name, self._current_attrs, cur.to_span()),
+                Integer(len(value), self._current_attrs.size_type, cur.to_span()),
+                self._current_attrs,
+                cur.to_span()),
             self._span(cur))
 
     def _parse_value(self) -> Value:

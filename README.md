@@ -21,12 +21,15 @@ Backus-Naur Form
 
 BDFLFile ::= FileAttribute*
              Import*
-             StructDef*
+             (StructDef | TypeDef)*
 
 Import ::= "import" String ";"
          | "import" "{" ImportRef ("," ImportRef)* [","] "}" "from" String ";"
 
 ImportRef ::= Identifier ["as" Identifier]
+
+# TODO
+TypeDef ::= Attribute* "type" Identifier "=" Type ";"
 
 StructDef ::= Attribute*
            "struct" Identifier "{"
@@ -39,7 +42,7 @@ ConditionalSection ::= "if" "(" Expression ")" "{"
                            ( FieldDef | ConditionalSection ) *
                        "}"
 
-Type ::= PrimitiveType | ArrayType | PointerType | TypeName
+Type ::= Attribute* (PrimitiveType | ArrayType | PointerType | TypeName)
 
 TypeName ::= Identifier
 
@@ -150,15 +153,16 @@ Space ::= r'\s+'
 Attributes
 ----------
 
-| Target              | Field Type            | Name              | Type/Values                | Default     |
-| ------------------- | --------------------- | ----------------- | -------------------------- | ----------- |
-| field, struct, file | (any)                 | endian            | `little` or `big`          | `little`    |
-| field, struct, file | (any)                 | alignment         | integer                    | `4`         |
-| field, struct, file | array                 | pack_array        | boolean                    | `true`      |
-| field, struct, file | dynamic array, string | size_type         | integer type               | `uint32`    |
-| field, struct, file | string                | encoding          | string                     | `"UTF-8"`   |
-| field, struct, file | bool                  | bool_size         | integer                    | `1`         |
-| field, struct, file | bool                  | true_value        | integer                    | `1`         |
-| field, struct, file | bool                  | false_value       | integer                    | `0`         |
-| struct, file        | N/A                   | dynamically_sized | `inclusive` or `exclusive` | `inclusive` |
-| field               | (any)                 | fixed             | N/A                        | N/A         |
+| Target                 | Field Type            | Name              | Type/Values                | Default     |
+| ---------------------- | --------------------- | ----------------- | -------------------------- | ----------- |
+| type ref, struct, file | (any)                 | endian            | `little` or `big`          | `little`    |
+| type ref, struct, file | (any)                 | alignment         | integer                    | `4`         |
+| type ref, struct, file | array                 | pack_array        | boolean                    | `true`      |
+| type ref, struct, file | dynamic array, string | size_type         | integer type               | `uint32`    |
+| type ref, struct, file | pointer               | offset_type       | integer type               | `uint32`    |
+| type ref, struct, file | string                | encoding          | string                     | `"UTF-8"`   |
+| type ref, struct, file | bool                  | bool_size         | integer                    | `1`         |
+| type ref, struct, file | bool                  | true_value        | integer                    | `1`         |
+| type ref, struct, file | bool                  | false_value       | integer                    | `0`         |
+| struct, file           | N/A                   | dynamically_sized | `inclusive` or `exclusive` | `inclusive` |
+| field                  | (any)                 | fixed             | N/A                        | N/A         |
