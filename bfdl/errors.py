@@ -47,6 +47,15 @@ class IllegalTokenError(ParserError):
         super().__init__(message or f"unexpected {token.token.name} token: {token.value}")
         self.token = token
 
+class IllegalValueError(ParserError):
+    location: Span
+    value: str
+
+    def __init__(self, value: str, location: Span, message: Optional[str] = None):
+        super().__init__(message or f"illegal value: {value}")
+        self.location = location
+        self.value    = value
+
 class IllegalImportError(ParserError):
     name: str
     fileid: int

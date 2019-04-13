@@ -16,7 +16,7 @@ from .errors import (
     UnbalancedParanthesesError, TypeNameConflictError, IllegalImportError, FieldRedeclaredError,
     FieldRedefinedError, TypeUnificationError, UndeclaredTypeError, IllegalReferenceError,
     FieldAccessError, ItemAccessError, AssignmentError, IntegerSignError, BFDLTypeError,
-    CircularTypeError, UninitializedFieldError,
+    CircularTypeError, UninitializedFieldError, IllegalValueError,
 )
 
 HEX = r'\\x[0-9a-fA-F]{2}'
@@ -55,6 +55,15 @@ ESC_CHAR_MAP = {
 
 ESC_BYTE_MAP = dict((esc, ord(char)) for esc, char in ESC_CHAR_MAP.items())
 
+class Endian(Enum):
+    LITTLE = 'little'
+    BIG    = 'big'
+
+class SizingVariant(Enum):
+    STATIC        = 'static'
+    DYN_EXCLUSIVE = 'exclusive'
+    DYN_INCLUSIVE = 'inclusive'
+
 def _replace_str_elem(match: Match[str]) -> str:
     val = match.group(1)
     if val: # ESC
@@ -91,6 +100,9 @@ class TypeDef(ASTNode):
             self.name == other.name
         )
 
+    def overload_attributes(self, attributes: "Attributes") -> "TypeDef":
+        raise NotImplementedError
+
 class TypeRef(ASTNode):
     name: str
     attributes: "Attributes"
@@ -106,7 +118,10 @@ class TypeRef(ASTNode):
     def resolve(self, parser: "Parser", module: "Module") -> TypeDef:
         if self.name not in module.types:
             raise UndeclaredTypeError(self.name, self.location)
-        return module.types[self.name]
+        typedef = module.types[self.name]
+        if typedef.attributes is self.attributes:
+            return typedef
+        return typedef.overload_attributes(self.attributes)
 
     def type_check(self, context: "TypeCheckContext") -> None:
         if context.inlined:
@@ -138,9 +153,11 @@ class FieldDef(ASTNode):
     def fold(self) -> None:
         self.type_ref = self.type_ref.fold()
 
+    # for type cycle detection
     def is_inlined(self, parser: "Parser", module: "Module", context: "StructDef") -> bool:
         typedef = self.type_ref.resolve(parser, module)
         return (
+            not isinstance(typedef, PointerTypeDef) and
             not isinstance(typedef, NullableType) and
             ((not self.optional or self.default is not None) and
              (self.default is None or not isinstance(
@@ -156,7 +173,8 @@ class StructDef(TypeDef):
 
     def __init__(self, name: str, attributes: "Attributes", location: Span,
                  fields: Optional[Dict[str, FieldDef]] = None,
-                 size: Optional[int] = None, sections: Optional[List[Section]] = None):
+                 size: Optional[int] = None,
+                 sections: Optional[List[Section]] = None):
         super().__init__(name, attributes, size, location)
         self.fields   = fields if fields is not None else OrderedDict()
         self.sections = sections if sections is not None else []
@@ -173,6 +191,25 @@ class StructDef(TypeDef):
             typedef = field.type_ref.resolve(parser, module)
             # TODO
 
+    def overload_attributes(self, attributes: "Attributes") -> "StructDef":
+        if self.attributes is attributes:
+            return self
+
+        attrs = Attributes(parent=self.attributes)
+        attrs.update(attributes)
+
+        fields: Dict[str, FieldDef] = OrderedDict()
+        for name, field in self.fields.items():
+            # XXX: rethink attributes overloading logic
+            #      I don't think this works in an expected way
+            #      Do I want to overload the defaults for fields?
+            #      Or do I want to overload any attributes?
+            #      What about attributes a field inherited from its parent struct?
+            fields[name] = field.overload_attributes(attributes)
+
+        return StructDef(self.name, attrs, self.location, fields, self.size, self.sections)
+
+# TODO
 class TypeCheckContext:
     parser: "Parser"
     module: "Module"
@@ -213,6 +250,12 @@ def unify_types(lhs: TypeDef, rhs: TypeDef) -> Optional[TypeDef]:
     if rhs is NEVER:
         return lhs
 
+    if isinstance(lhs, PointerTypeDef):
+        if isinstance(rhs, PointerTypeDef):
+            return unify_types(lhs.item, rhs.item)
+        else:
+            return None
+
     if isinstance(lhs, NullableType):
         if isinstance(rhs, NullableType):
             typedef = unify_types(lhs.typedef, rhs.typedef)
@@ -224,6 +267,26 @@ def unify_types(lhs: TypeDef, rhs: TypeDef) -> Optional[TypeDef]:
     if isinstance(rhs, NullableType):
         typedef = unify_types(lhs, rhs.typedef)
         return NullableType(typedef) if typedef is not None else None
+
+
+    if isinstance(lhs, ArrayTypeDef) and isinstance(rhs, ArrayTypeDef):
+        items = unify_types(lhs.items, rhs.items)
+        if items is None:
+            return None
+
+        count: Union[int, IntegerType, None]
+        if isinstance(lhs.count, int) and isinstance(rhs.count, int):
+            count = max(lhs.count, rhs.count)
+        elif isinstance(lhs.count, TypeDef) and isinstance(rhs.count, TypeDef):
+            count_uni = unify_types(lhs.count, rhs.count)
+            assert isinstance(count_uni, IntegerType)
+            count = count_uni
+        elif lhs.count is None and rhs.count is None:
+            count = None
+        else:
+            count = SIZE
+
+        return ArrayTypeDef(items, count)
 
     if not isinstance(lhs, PrimitiveType) or not isinstance(rhs, PrimitiveType):
         return None
@@ -257,10 +320,18 @@ def is_assignable(source: TypeDef, target: TypeDef) -> bool:
         return True
 
     if target is NEVER:
-        return False
+        return source is NEVER
 
     if source is NEVER:
         return True
+
+    if isinstance(target, PointerTypeDef):
+        if isinstance(source, PointerTypeDef):
+            return is_assignable(source.item, target.item)
+        else:
+            return is_assignable(source, target.item)
+    elif isinstance(source, PointerTypeDef):
+        return is_assignable(source.item, target)
 
     if isinstance(source, NullableType):
         if isinstance(target, NullableType):
@@ -709,7 +780,9 @@ class PointerTypeRef(TypeRef):
         return self
 
     def resolve(self, parser: "Parser", module: "Module") -> TypeDef:
-        return parser._get_pointer_type(self, module)
+        item = self.item_ref.resolve(parser, module)
+        offset = self.offset_type
+        return PointerTypeDef(offset, item, self.attributes, self.location)
 
     def type_check(self, context: TypeCheckContext) -> None:
         self.item_ref.type_check(context)
@@ -745,7 +818,15 @@ class ArrayTypeRef(TypeRef):
         return self
 
     def resolve(self, parser: "Parser", module: "Module") -> TypeDef:
-        return parser._get_array_type(self, module)
+        items = self.item_ref.resolve(parser, module)
+        count: Union[int, IntegerType, None]
+        if isinstance(self.count, IntegerType):
+            count = self.count
+        elif isinstance(self.count, Integer):
+            count = self.count.value
+        else:
+            count = None
+        return ArrayTypeDef(items, count, self.attributes, self.location)
 
     def type_check(self, context: TypeCheckContext) -> None:
         if self.count is None or not isinstance(self.count, Integer):
@@ -753,13 +834,15 @@ class ArrayTypeRef(TypeRef):
 
         self.item_ref.type_check(context)
         if isinstance(self.count, Expr):
-            self.count.type_check(self.attributes.get('array_size', SIZE), context)
+            self.count.type_check(self.attributes.size_type, context)
 
 class PrimitiveType(TypeDef):
     pytype: type
     size:   int
 
-    def __init__(self, pytype: type, size: int, name: str, attributes: Optional[Attributes] = None, location: Optional[Span] = None):
+    def __init__(self, pytype: type, size: int, name: str,
+                 attributes: Optional[Attributes] = None,
+                 location: Optional[Span] = None):
         super().__init__(name, attributes or GLOBAL_ATTRS, size, location or Span(0, 0, 0))
         self.pytype = pytype
 
@@ -793,7 +876,7 @@ BOOL    = PrimitiveType(bool, 1, "bool")
 FLOAT   = FloatType(float, 4, "float")
 DOUBLE  = FloatType(float, 8, "double")
 
-SIZE = UINT64
+SIZE = UINT32
 
 PRIMITIVE_MAP: Dict[str, PrimitiveType] = dict((tp.name, tp) for tp in [
     UINT8, INT8, BYTE, UINT16, INT16, UINT32, INT32,
@@ -833,7 +916,9 @@ class NullableType(TypeDef):
 NULL = NullableType(NEVER)
 
 class StringType(TypeDef):
-    def __init__(self, name: str, size: Optional[int] = None, attributes: Optional[Attributes] = None, location: Optional[Span] = None):
+    def __init__(self, name: str, size: Optional[int] = None,
+                 attributes: Optional[Attributes] = None,
+                 location: Optional[Span] = None):
         super().__init__(name, attributes or GLOBAL_ATTRS, size, location or Span(0, 0, 0))
 
 STRING = StringType("string")
@@ -843,12 +928,6 @@ class Value(Expr):
 
     def get_type_def(self, parser: "Parser", module: "Module", context: Optional[StructDef]) -> TypeDef:
         raise NotImplementedError
-
-    def eq(self, other: Value) -> Value:
-        return Bool(self.value == other.value, self.location)
-
-    def ne(self, other: Value) -> Value:
-        return Bool(self.value != other.value, self.location)
 
 class AtomicValue(Value):
     def get_type_def(self, parser: "Parser", module: "Module", context: Optional[StructDef]) -> TypeDef:
@@ -1016,9 +1095,11 @@ class ArrayTypeDef(TypeDef):
     items: TypeDef
     count: Union[int, IntegerType, None]
 
-    def __init__(self, items: TypeDef, count: Union[int, IntegerType, None], attributes: Attributes, location: Span):
+    def __init__(self, items: TypeDef, count: Union[int, IntegerType, None],
+                 attributes: Optional[Attributes] = None,
+                 location: Optional[Span] = None):
         name, size = _array_type_info(items, count)
-        super().__init__(name, attributes, size, location)
+        super().__init__(name, attributes or GLOBAL_ATTRS, size, location or Span(0, 0, 0))
         self.items = items
         self.count = count
 
@@ -1073,21 +1154,117 @@ class Attributes:
             raise AttributeRedeclaredError(attr.name, other.location, attr.location)
         self.defined_attrs[attr.name] = attr
 
+    def update(self, other: Attributes) -> None:
+        if other.parent is not None:
+            self.update(other.parent)
+        self.defined_attrs.update(other.defined_attrs)
+
+    def flatten(self) -> Attributes:
+        attrs = Attributes()
+        attrs.update(self)
+        return attrs
+
     @property
     def fixed(self) -> bool:
         return bool(self.get('fixed', False))
 
     @property
     def size_type(self) -> IntegerType:
-        ident = self['size_type'].value
+        ident = self.get('size_type')
+        if ident is None:
+            return SIZE
         assert isinstance(ident, Identifier)
         return INTEGER_MAP[ident.name]
 
     @property
     def offset_type(self) -> IntegerType:
-        ident = self['offset_type'].value
+        ident = self.get('offset_type')
+        if ident is None:
+            return SIZE
         assert isinstance(ident, Identifier)
         return INTEGER_MAP[ident.name]
+
+    @property
+    def alignment(self) -> int:
+        align = self.get('alignment')
+        if align is None:
+            return 4
+        assert isinstance(align, Integer)
+        return align.value
+
+    @property
+    def endian(self) -> Endian:
+        ident = self.get('offset_type')
+        if ident is None:
+            return Endian.LITTLE
+        assert isinstance(ident, Identifier)
+        value = ident.name
+
+        if value == 'little':
+            return Endian.LITTLE
+
+        if value == 'big':
+            return Endian.BIG
+
+        raise IllegalValueError(value, ident.location)
+
+    @property
+    def pack_array(self) -> bool:
+        return bool(self.get('pack_array', True))
+
+    @property
+    def encoding(self) -> str:
+        value = self.get('encoding')
+        if value is None:
+            return "UTF-8"
+        assert isinstance(value, Value)
+        if not isinstance(value, String):
+            raise IllegalValueError(str(value.value), value.location)
+        return value.value
+
+    @property
+    def bool_size(self) -> int:
+        bool_size = self.get('bool_size')
+        if bool_size is None:
+            return 4
+        assert isinstance(bool_size, Integer)
+        return bool_size.value
+
+    @property
+    def true_value(self) -> int:
+        true_value = self.get('true_value')
+        if true_value is None:
+            return 1
+        assert isinstance(true_value, Integer)
+        return true_value.value
+
+    @property
+    def false_value(self) -> int:
+        false_value = self.get('false_value')
+        if false_value is None:
+            return 0
+        assert isinstance(false_value, Integer)
+        return false_value.value
+
+    @property
+    def sizing(self) -> SizingVariant:
+        ident = self.get('sizing')
+        if ident is None:
+            return SizingVariant.STATIC
+
+        assert isinstance(ident, Identifier)
+        value = ident.name
+
+        if value == 'static':
+            return SizingVariant.STATIC
+
+        if value == 'inclusive':
+            return SizingVariant.DYN_INCLUSIVE
+
+        if value == 'exclusive':
+            return SizingVariant.DYN_EXCLUSIVE
+
+        raise IllegalValueError(value, ident.location)
 
 class ImportSymbol:
     name: Identifier
@@ -1145,12 +1322,7 @@ class Module:
 PRELUDE = Module(0, '<prelude>', '')
 PRELUDE.state = ModuleState.FINISHED
 
-GLOBAL_ATTRS = Attributes(
-    dict((attr.name, attr) for attr in [
-        Attribute('size_type',   Identifier(SIZE.name, Span(0, 0, 0)), Span(0, 0, 0)),
-        Attribute('offset_type', Identifier(SIZE.name, Span(0, 0, 0)), Span(0, 0, 0)),
-    ])
-)
+GLOBAL_ATTRS = Attributes()
 
 class Parser:
     _root_path:      str
@@ -1161,8 +1333,6 @@ class Parser:
     _current_token:  Optional[Atom]
     _current_module: Module
     _current_attrs:  Attributes
-    _array_types:    Dict[Tuple[int, str], ArrayTypeDef]
-    _pointer_types:  Dict[Tuple[int, str], PointerTypeDef]
 
     def __init__(self, root_path: str = '.'):
         self._root_path      = abspath(root_path)
@@ -1173,38 +1343,6 @@ class Parser:
         self._current_token  = None
         self._current_module = PRELUDE
         self._current_attrs  = GLOBAL_ATTRS
-        self._array_types    = {}
-        self._pointer_types  = {}
-
-    def _get_array_type(self, type_ref: ArrayTypeRef, module: Module) -> ArrayTypeDef:
-        items = type_ref.item_ref.resolve(self, module)
-        count: Union[int, IntegerType, None]
-        if isinstance(type_ref.count, IntegerType):
-            count = type_ref.count
-        elif isinstance(type_ref.count, Integer):
-            count = type_ref.count.value
-        else:
-            count = None
-
-        name, _ = _array_type_info(items, count)
-        key = (items.location.fileid, name)
-        if key in self._array_types:
-            return self._array_types[key]
-
-        typedef = ArrayTypeDef(items, count, type_ref.attributes, type_ref.location)
-        self._array_types[key] = typedef
-        return typedef
-
-    def _get_pointer_type(self, type_ref: PointerTypeRef, module: Module) -> PointerTypeDef:
-        item = type_ref.item_ref.resolve(self, module)
-        offset = type_ref.offset_type
-        name = f'{item.name}*<{offset.name}>'
-        key = (item.location.fileid, name)
-        if key in self._pointer_types:
-            return self._pointer_types[key]
-        typedef = PointerTypeDef(offset, item, type_ref.attributes, type_ref.location)
-        self._pointer_types[key] = typedef
-        return typedef
 
     def parse_file(self, filename: str) -> Module:
         filename = join_path(self._root_path, filename)
@@ -1599,11 +1737,14 @@ class Parser:
     def _parse_type_ref(self) -> TypeRef:
         cur = self._cursor()
         parent_attrs = self._current_attrs
-        attrs = Attributes(parent=parent_attrs)
-        while self._has_next(TOK.HASH):
-            attr = self._parse_attribute()
-            attrs.declare(attr)
-        self._current_attrs = attrs
+        if self._has_next(TOK.HASH):
+            attrs = Attributes(parent=parent_attrs)
+            while self._has_next(TOK.HASH):
+                attr = self._parse_attribute()
+                attrs.declare(attr)
+            self._current_attrs = attrs
+        else:
+            attrs = parent_attrs
 
         name_tok = self._expect(TOK.ID)
         type_ref = TypeRef(name_tok.value, attrs, cur.to_span())
