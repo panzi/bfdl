@@ -39,7 +39,7 @@ ConditionalSection ::= "if" "(" Expression ")" "{"
                            ( FieldDef | ConditionalSection ) *
                        "}"
 
-Type ::= PrimitiveType | ArrayType | TypeName
+Type ::= PrimitiveType | ArrayType | PointerType | TypeName
 
 TypeName ::= Identifier
 
@@ -47,6 +47,8 @@ ArrayType ::= Type "[" "]"
             | Type "[" IntegerType "]"
             | Type "[" Integer "]"
             | Type "[" Expression "]"
+
+PointerType ::= Type "*" [ "<" IntegerType ">" ]
 
 IntegerType ::= "byte" | "uint8" | "int8" | "uint16" | "int16"
               | "uint32" | "int32" | "uint64" | "int64"
@@ -70,9 +72,9 @@ AtomicValue ::= PrimitiveValue | String | ByteArray | Null
 
 PrimitiveValue ::= Integer | Boolean | Float | Byte
 
-ArrayLiteral ::= ArrayType "{" Value ("," Value)* [","] "}"
+ArrayLiteral ::= "[" Value ("," Value)* [","] "]"
 
-StructLiteral ::= TypeName "{" FieldAssignment ("," FieldAssignment) [","] "}"
+StructLiteral ::= "{" FieldAssignment ("," FieldAssignment) [","] "}"
 
 FieldAssignment ::= Identifier "=" Value
 
@@ -118,6 +120,7 @@ UnaryExpr ::= UnaryOp UnaryExpr | "raise" String | PostfixExpr
 PostfixExpr ::= PrimaryExpr
               | PostfixExpr "." Identifier
               | PostfixExpr "[" Expression "]"
+              | PostfixExpr "as" Type # TODO
 
 PrimaryExpr ::= Identifier | Value | "(" Expression ")"
 

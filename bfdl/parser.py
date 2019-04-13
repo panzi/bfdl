@@ -684,6 +684,31 @@ class ArrayItemAccessExpr(PostfixExpr):
             return ArrayItemAccessExpr(array, item, self.location)
         return self
 
+class PointerTypeRef(TypeRef):
+    offset_type: Optional[IntegerType]
+    item_ref:    TypeRef
+
+    def __init__(self, offset_type: Optional[IntegerType], item_ref: TypeRef, location: Span):
+        offset_name = offset_type.name if offset_type is not None else ''
+        super().__init__(f'{offset_name}->{item_ref.name}', location)
+        self.offset_type = offset_type
+        self.item_ref    = item_ref
+
+    def fold(self) -> "PointerTypeRef":
+        item_ref = self.item_ref.fold()
+
+        if item_ref is not self.item_ref:
+            return PointerTypeRef(self.offset_type, item_ref, self.location)
+
+        return self
+
+    def resolve(self, parser: "Parser", module: "Module") -> TypeDef:
+        item = self.item_ref.resolve(parser, module)
+        return parser._get_pointer_type(self.offset_type, item, self.location)
+
+    def type_check(self, context: TypeCheckContext) -> None:
+        self.item_ref.type_check(context)
+
 class ArrayTypeRef(TypeRef):
     item_ref: TypeRef
     count:    Union[Expr, IntegerType]
@@ -996,6 +1021,15 @@ class ArrayTypeDef(TypeDef):
         self.items = items
         self.count = count
 
+class PointerTypeDef(TypeDef):
+    offset: IntegerType
+    item:   TypeDef
+
+    def __init__(self, offset: IntegerType, item: TypeDef, location: Span):
+        super().__init__(f'{offset.name}->{item.name}', offset.size, location)
+        self.offset = offset
+        self.item   = item
+
 class Attribute(ASTNode):
     name: str
     value: Union[Value, TypeDef, Identifier, None]
@@ -1120,6 +1154,7 @@ class Parser:
     _current_module: Module
     _current_attrs:  Attributes
     _array_types:    Dict[Tuple[int, str], ArrayTypeDef]
+    _pointer_types:  Dict[Tuple[int, str], PointerTypeDef]
 
     def __init__(self, root_path: str = '.'):
         self._root_path      = abspath(root_path)
@@ -1130,15 +1165,26 @@ class Parser:
         self._current_token  = None
         self._current_module = PRELUDE
         self._current_attrs  = GLOBAL_ATTRS
+        self._array_types    = {}
+        self._pointer_types  = {}
 
     def _get_array_type(self, items: TypeDef, count: Union[int, IntegerType, None], location: Span) -> ArrayTypeDef:
         name, _ = _array_type_info(items, count)
-        key = (location.fileid, name)
+        key = (items.location.fileid, name)
         if key in self._array_types:
             return self._array_types[key]
 
         typedef = ArrayTypeDef(items, count, location)
         self._array_types[key] = typedef
+        return typedef
+
+    def _get_pointer_type(self, offset: IntegerType, item: TypeDef, location: Span) -> PointerTypeDef:
+        name = f'{offset.name}->{item.name}'
+        key = (item.location.fileid, name)
+        if key in self._pointer_types:
+            return self._pointer_types[key]
+        typedef = PointerTypeDef(offset, item, location)
+        self._pointer_types[key] = typedef
         return typedef
 
     def parse_file(self, filename: str) -> Module:
@@ -1536,16 +1582,27 @@ class Parser:
         name_tok = self._expect(TOK.ID)
         type_ref = TypeRef(name_tok.value, cur.to_span())
 
-        while self._has_next(TOK.BR_OPEN):
-            with self._expect_paren(TOK.BR_OPEN):
-                size: Union[Expr, IntegerType]
-                if not self._has_next(TOK.BR_CLOSE):
-                    size = self._parse_expr()
-                    if isinstance(size, Identifier) and size.name in INTEGER_MAP:
-                        size = INTEGER_MAP[size.name]
-                else:
-                    size = self._current_attrs.size_type
-            type_ref = ArrayTypeRef(type_ref, size, self._span(cur))
+        while self._has_next(TOK.BR_OPEN) or self._has_next(TOK.MUL):
+            if self._has_next(TOK.BR_OPEN):
+                with self._expect_paren(TOK.BR_OPEN):
+                    size: Union[Expr, IntegerType]
+                    if not self._has_next(TOK.BR_CLOSE):
+                        size = self._parse_expr()
+                        if isinstance(size, Identifier) and size.name in INTEGER_MAP:
+                            # XXX: not future safe for type aliases or custom integer types
+                            size = INTEGER_MAP[size.name]
+                    else:
+                        size = self._current_attrs.size_type
+                type_ref = ArrayTypeRef(type_ref, size, self._span(cur))
+            else:
+                self._next_token()
+                offset: Optional[IntegerType] = None
+                if self._has_next(TOK.LT):
+                    with self._expect_paren(TOK.LT):
+                        ident = self._parse_id()
+                        # XXX: not future safe for type aliases or custom integer types
+                        offset = INTEGER_MAP[ident.name]
+                type_ref = PointerTypeRef(offset, type_ref, self._span(cur))
 
         return type_ref
 

@@ -64,6 +64,7 @@ OPEN_PARENS = {
     TOK.PAR_CLOSE: TOK.PAR_OPEN,
     TOK.BR_CLOSE:  TOK.BR_OPEN,
     TOK.CUR_CLOSE: TOK.CUR_OPEN,
+    TOK.GT:        TOK.LT,
 }
 
 CLOSE_PARENS = dict((val, key) for key, val in OPEN_PARENS.items())
